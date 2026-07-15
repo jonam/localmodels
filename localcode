@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Local code generation agent powered by Ollama + Qwen2.5-Coder.
+Reads, writes, edits files, and runs commands - like Claude Code but local."""
+
+import sys
+import subprocess
+import json
+import urllib.request
+import urllib.error
+import os
+import signal
+import readline
+import shutil
+import glob
+import re
+
+MODEL = os.environ.get("LOCALCODE_MODEL", "qwen2.5-coder:7b")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+WORKDIR = os.getcwd()
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. Use this to understand existing code before making changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the working directory"}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a file with the given content. Use for creating new files or complete rewrites.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the working directory"},
+                    "content": {"type": "string", "description": "Complete file content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace a specific string in a file. The old_string must match exactly (including whitespace/indentation).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the working directory"},
+                    "old_string": {"type": "string", "description": "Exact string to find in the file"},
+                    "new_string": {"type": "string", "description": "String to replace it with"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command and return its output. Use for: listing files, running tests, installing packages, git operations, building projects.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute"}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in a directory. Use to understand project structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path relative to working directory. Use '.' for current directory."},
+                    "recursive": {"type": "boolean", "description": "If true, list files recursively (max 3 levels deep)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search for a pattern in files using grep. Returns matching lines with file paths and line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Search pattern (regex supported)"},
+                    "path": {"type": "string", "description": "Directory or file to search in. Defaults to '.'"},
+                    "file_pattern": {"type": "string", "description": "Glob pattern to filter files, e.g. '*.py' or '*.ts'"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+]
+
+def build_system_prompt():
+    """Build system prompt with project context from existing files."""
+    base = f"""You are a local coding agent. You help developers generate, edit, and manage code.
+
+Working directory: {WORKDIR}
+
+You have tools to read, write, edit files and run commands. USE THEM. Do not just show code in chat - actually create/edit the files.
+
+When asked to generate code:
+1. Read an existing file in the same directory to see the pattern
+2. Create the new file following EXACTLY the same pattern, imports, and framework
+3. Run commands to verify if appropriate
+
+When asked to modify code:
+1. Read the file first
+2. Make targeted edits (edit_file) or full rewrites (write_file)
+
+CRITICAL RULES:
+- Always match the framework and style of existing files in the project
+- If existing files use Flask, use Flask. If they use Express, use Express.
+- Do NOT switch frameworks or libraries unless explicitly asked
+- Write the file content directly. Do not just show it in chat.
+- Be concise. Act immediately."""
+
+    # Auto-include project context if there's a recognizable structure
+    context_files = []
+    for pattern_file in ["routes/_template.py", "CONVENTIONS.md"]:
+        full = os.path.join(WORKDIR, pattern_file)
+        if os.path.isfile(full):
+            try:
+                with open(full) as f:
+                    context_files.append(f"--- {pattern_file} ---\n{f.read()}")
+            except Exception:
+                pass
+
+    if context_files:
+        base += "\n\nPROJECT CONTEXT (follow these patterns):\n" + "\n".join(context_files)
+
+    return base
+
+
+SYSTEM_PROMPT = build_system_prompt()
+
+
+def check_ollama():
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            return [m["name"] for m in data.get("models", [])]
+    except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        return None
+
+
+def check_model_available(models):
+    for m in models:
+        if m == MODEL or m.startswith(MODEL.split(":")[0]):
+            return True
+    return False
+
+
+def resolve_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(WORKDIR, path))
+
+
+def execute_tool(name, args):
+    if name == "read_file":
+        path = resolve_path(args["path"])
+        try:
+            with open(path) as f:
+                content = f.read()
+            lines = content.split("\n")
+            if len(lines) > 500:
+                return f"[{len(lines)} lines total, showing first 500]\n" + "\n".join(lines[:500])
+            return content
+        except FileNotFoundError:
+            return f"Error: File not found: {args['path']}"
+        except PermissionError:
+            return f"Error: Permission denied: {args['path']}"
+
+    elif name == "write_file":
+        path = resolve_path(args["path"])
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(args["content"])
+        return f"Written: {args['path']}"
+
+    elif name == "edit_file":
+        path = resolve_path(args["path"])
+        try:
+            with open(path) as f:
+                content = f.read()
+        except FileNotFoundError:
+            return f"Error: File not found: {args['path']}"
+
+        old = args["old_string"]
+        new = args["new_string"]
+        if old not in content:
+            return f"Error: old_string not found in {args['path']}. Read the file first to get exact content."
+        count = content.count(old)
+        if count > 1:
+            return f"Warning: old_string appears {count} times. Replacing first occurrence only."
+        content = content.replace(old, new, 1)
+        with open(path, "w") as f:
+            f.write(content)
+        return f"Edited: {args['path']}"
+
+    elif name == "run_command":
+        cmd = args["command"]
+        dangerous = ["rm -rf /", "rm -rf ~", "> /dev/sda", "mkfs", "dd if="]
+        if any(d in cmd for d in dangerous):
+            return "Error: Refusing to run potentially destructive command."
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=WORKDIR
+            )
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += ("\n" if output else "") + result.stderr
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            return output[:5000] if output else "[no output]"
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out (30s limit)"
+
+    elif name == "list_files":
+        path = resolve_path(args.get("path", "."))
+        recursive = args.get("recursive", False)
+        try:
+            if recursive:
+                files = []
+                for root, dirs, filenames in os.walk(path):
+                    depth = root.replace(path, "").count(os.sep)
+                    if depth >= 3:
+                        dirs.clear()
+                        continue
+                    dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__", ".next", "venv", ".venv")]
+                    for f in filenames:
+                        rel = os.path.relpath(os.path.join(root, f), WORKDIR)
+                        files.append(rel)
+                return "\n".join(sorted(files)[:200]) or "[empty directory]"
+            else:
+                entries = []
+                for e in sorted(os.listdir(path)):
+                    full = os.path.join(path, e)
+                    prefix = "d " if os.path.isdir(full) else "f "
+                    entries.append(prefix + e)
+                return "\n".join(entries) or "[empty directory]"
+        except FileNotFoundError:
+            return f"Error: Directory not found: {args['path']}"
+
+    elif name == "search_files":
+        pattern = args["pattern"]
+        path = resolve_path(args.get("path", "."))
+        file_pattern = args.get("file_pattern", "")
+        cmd = ["grep", "-rn", "--include=" + file_pattern if file_pattern else None, pattern, path]
+        cmd = [c for c in cmd if c is not None]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=WORKDIR)
+            output = result.stdout
+            lines = output.strip().split("\n")
+            if len(lines) > 50:
+                return "\n".join(lines[:50]) + f"\n[... {len(lines) - 50} more matches]"
+            return output or "[no matches]"
+        except subprocess.TimeoutExpired:
+            return "Error: Search timed out"
+
+    return f"Error: Unknown tool: {name}"
+
+
+TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+
+
+def try_fix_json(text):
+    """Attempt to fix common JSON issues from the model."""
+    # Replace triple-quoted strings (Python-style) with proper JSON strings
+    # """...""" -> "..."
+    text = re.sub(r'"""(.*?)"""', lambda m: json.dumps(m.group(1)), text, flags=re.DOTALL)
+    # Replace single quotes with double quotes (careful with content)
+    # Only if it looks like the outer structure uses single quotes
+    if text.strip().startswith("{") and "'" in text and '"name"' not in text:
+        text = text.replace("'", '"')
+    return text
+
+
+def extract_tool_call_fields(text):
+    """Extract name and arguments even from malformed JSON using regex."""
+    name_match = re.search(r'"name"\s*:\s*"(\w+)"', text)
+    if not name_match or name_match.group(1) not in TOOL_NAMES:
+        return None
+
+    name = name_match.group(1)
+
+    # For write_file, extract path and content separately since content often breaks JSON
+    if name == "write_file":
+        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', text)
+        # Content is everything between "content": " and the last "}
+        content_match = re.search(r'"content"\s*:\s*"(.*)', text, re.DOTALL)
+        if not content_match:
+            # Try triple-quoted or unquoted content
+            content_match = re.search(r'"content"\s*:\s*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')', text, re.DOTALL)
+            if content_match:
+                content = content_match.group(1) or content_match.group(2)
+                return {"function": {"name": name, "arguments": {"path": path_match.group(1), "content": content}}}
+        if path_match and content_match:
+            content = content_match.group(1)
+            # Remove trailing "} and variations
+            content = re.sub(r'"\s*\}\s*\}\s*$', '', content)
+            content = re.sub(r'"\s*\}\s*$', '', content)
+            # Unescape JSON string escapes.
+            # Model outputs literal backslash-char sequences: \n, \t, \", \\
+            content = (content
+                .replace('\\\\', '\x00')
+                .replace('\\n', '\n')
+                .replace('\\t', '\t')
+                .replace('\\"', '"')
+                .replace('\\/', '/')
+                .replace('\x00', '\\')
+            )
+            # Also handle case where model uses single-escaped \" as literal chars
+            if '\\' in content and '"' not in content.split('\\')[0]:
+                pass  # already handled above
+            return {"function": {"name": name, "arguments": {"path": path_match.group(1), "content": content}}}
+
+    if name == "edit_file":
+        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', text)
+        old_match = re.search(r'"old_string"\s*:\s*"(.*?)"(?:\s*,|\s*\})', text, re.DOTALL)
+        new_match = re.search(r'"new_string"\s*:\s*"(.*?)"(?:\s*,|\s*\})', text, re.DOTALL)
+        if path_match and old_match and new_match:
+            old_s = old_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            new_s = new_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            return {"function": {"name": name, "arguments": {"path": path_match.group(1), "old_string": old_s, "new_string": new_s}}}
+
+    if name == "read_file":
+        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', text)
+        if path_match:
+            return {"function": {"name": name, "arguments": {"path": path_match.group(1)}}}
+
+    if name == "run_command":
+        cmd_match = re.search(r'"command"\s*:\s*"(.*?)"', text, re.DOTALL)
+        if cmd_match:
+            cmd = cmd_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            return {"function": {"name": name, "arguments": {"command": cmd}}}
+
+    if name == "list_files":
+        path_match = re.search(r'"path"\s*:\s*"([^"]*)"', text)
+        recursive_match = re.search(r'"recursive"\s*:\s*(true|false)', text)
+        args = {"path": path_match.group(1) if path_match else "."}
+        if recursive_match:
+            args["recursive"] = recursive_match.group(1) == "true"
+        return {"function": {"name": name, "arguments": args}}
+
+    if name == "search_files":
+        pattern_match = re.search(r'"pattern"\s*:\s*"([^"]*)"', text)
+        if pattern_match:
+            args = {"pattern": pattern_match.group(1)}
+            path_match = re.search(r'"path"\s*:\s*"([^"]*)"', text)
+            if path_match:
+                args["path"] = path_match.group(1)
+            return {"function": {"name": name, "arguments": args}}
+
+    return None
+
+
+def parse_tool_calls_from_text(text):
+    """Parse tool calls that the model outputs as JSON text instead of structured tool_calls.
+    Handles: raw JSON, markdown code fences, triple-quoted strings, and malformed JSON."""
+    calls = []
+
+    # Strip markdown code fences: ```json ... ``` or ``` ... ```
+    stripped = re.sub(r'```(?:json|python)?\s*\n?', '', text).strip()
+    stripped = re.sub(r'```', '', stripped).strip()
+
+    # Normalize tool call JSON: model may use different field names
+    def normalize_tool_obj(obj):
+        """Handle various formats the model uses for tool calls."""
+        # Standard: {"name": "...", "arguments": {...}}
+        if "name" in obj and "arguments" in obj:
+            if obj["name"] in TOOL_NAMES:
+                return {"function": {"name": obj["name"], "arguments": obj["arguments"]}}
+        # Variant: {"tool_call": {"function_name": "...", "parameters": {...}}}
+        if "tool_call" in obj:
+            tc = obj["tool_call"]
+            fn = tc.get("function_name") or tc.get("name", "")
+            # Map common aliases
+            fn_map = {"create_file": "write_file", "create": "write_file", "read": "read_file",
+                      "write": "write_file", "edit": "edit_file", "run": "run_command",
+                      "search": "search_files", "list": "list_files"}
+            fn = fn_map.get(fn, fn)
+            args = tc.get("parameters") or tc.get("arguments", {})
+            # Normalize arg names
+            if "file_path" in args and "path" not in args:
+                args["path"] = args.pop("file_path")
+            if fn in TOOL_NAMES:
+                return {"function": {"name": fn, "arguments": args}}
+        # Variant: {"function": {"name": "...", "arguments": {...}}}
+        if "function" in obj:
+            fn = obj["function"]
+            if isinstance(fn, dict) and "name" in fn:
+                name = fn["name"]
+                args = fn.get("arguments") or fn.get("parameters", {})
+                if name in TOOL_NAMES:
+                    return {"function": {"name": name, "arguments": args}}
+        return None
+
+    # Try parsing as valid JSON first
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            result = normalize_tool_obj(obj)
+            if result:
+                return [result]
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    result = normalize_tool_obj(item)
+                    if result:
+                        calls.append(result)
+            if calls:
+                return calls
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try fixing common JSON issues and re-parsing
+    fixed = try_fix_json(stripped)
+    try:
+        obj = json.loads(fixed)
+        if isinstance(obj, dict):
+            result = normalize_tool_obj(obj)
+            if result:
+                return [result]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Find JSON objects embedded in text using brace matching
+    brace_depth = 0
+    start = None
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(stripped):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            if brace_depth == 0:
+                start = i
+            brace_depth += 1
+        elif ch == '}':
+            brace_depth -= 1
+            if brace_depth == 0 and start is not None:
+                candidate = stripped[start:i+1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                        if obj["name"] in TOOL_NAMES:
+                            calls.append({"function": {"name": obj["name"], "arguments": obj["arguments"]}})
+                except (json.JSONDecodeError, ValueError):
+                    # Try regex extraction as last resort
+                    extracted = extract_tool_call_fields(candidate)
+                    if extracted:
+                        calls.append(extracted)
+                start = None
+
+    if calls:
+        return calls
+
+    # Last resort: regex extraction on the whole text
+    extracted = extract_tool_call_fields(stripped)
+    if extracted:
+        return [extracted]
+
+    return calls
+
+
+def call_ollama(messages):
+    payload = json.dumps({
+        "model": MODEL,
+        "messages": messages,
+        "tools": TOOLS,
+        "stream": False,
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read())
+
+
+def format_action(fn_name, fn_args):
+    if fn_name == "read_file":
+        return f"read {fn_args.get('path', '')}"
+    elif fn_name == "write_file":
+        return f"write {fn_args.get('path', '')}"
+    elif fn_name == "edit_file":
+        return f"edit {fn_args.get('path', '')}"
+    elif fn_name == "run_command":
+        return f"run: {fn_args.get('command', '')}"
+    elif fn_name == "list_files":
+        return f"ls {fn_args.get('path', '.')}"
+    elif fn_name == "search_files":
+        return f"grep '{fn_args.get('pattern', '')}'"
+    return fn_name
+
+
+def agent_loop(messages):
+    max_iterations = 10
+    recent_actions = []
+
+    for i in range(max_iterations):
+        try:
+            response = call_ollama(messages)
+        except urllib.error.URLError as e:
+            print(f"\n  Error communicating with Ollama: {e}")
+            return
+        except Exception as e:
+            print(f"\n  Error: {e}")
+            return
+
+        msg = response.get("message", {})
+        content = msg.get("content", "")
+        tool_calls = msg.get("tool_calls", [])
+
+        # If model returned tool calls as text, parse them out
+        if not tool_calls and content:
+            parsed = parse_tool_calls_from_text(content)
+            if parsed:
+                tool_calls = parsed
+                content = ""
+
+        # Fallback: if model just output a code block (not a tool call), write it
+        # Only on first iteration, only for the target file extension
+        if not tool_calls and content and "```" in content and i == 0:
+            target_path = None
+            target_ext = None
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    path_match = re.search(r'(?:create|write|make|add)\s+(\S+\.(\w+))', m.get("content", ""), re.IGNORECASE)
+                    if path_match:
+                        target_path = path_match.group(1)
+                        target_ext = path_match.group(2)
+                    break
+
+            if target_path and target_ext:
+                # Map extensions to fence languages
+                ext_langs = {"py": ["python", "py"], "js": ["javascript", "js"], "ts": ["typescript", "ts"],
+                             "tsx": ["tsx", "typescript"], "sh": ["bash", "sh"], "yaml": ["yaml"], "yml": ["yaml"]}
+                valid_langs = ext_langs.get(target_ext, [target_ext])
+                # Match first code block with a matching language
+                pattern = r'```(' + '|'.join(valid_langs) + r')\n(.*?)```'
+                code_match = re.search(pattern, content, re.DOTALL)
+                if code_match:
+                    code = code_match.group(2).rstrip()
+                    print(f"\n{content}")
+                    # Write the file directly and stop
+                    result = execute_tool("write_file", {"path": target_path, "content": code})
+                    print(f"\n  \033[2m[write {target_path}]\033[0m")
+                    messages.append(msg)
+                    return
+
+        messages.append(msg)
+
+        if content:
+            print(f"\n{content}")
+
+        if not tool_calls:
+            return
+
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            fn_args = tc["function"]["arguments"]
+
+            # Loop detection: if same action repeated 3+ times, break
+            action_key = f"{fn_name}:{fn_args.get('path', fn_args.get('command', ''))}"
+            recent_actions.append(action_key)
+            if len(recent_actions) >= 3 and len(set(recent_actions[-3:])) == 1:
+                print(f"\n  \033[33m[stopped: repeated action detected]\033[0m")
+                messages.append({"role": "tool", "content": "Stopping: you are repeating the same action. Summarize what you accomplished and what still needs to be done."})
+                try:
+                    final = call_ollama(messages)
+                    final_content = final.get("message", {}).get("content", "")
+                    if final_content:
+                        print(f"\n{final_content}")
+                except Exception:
+                    pass
+                return
+
+            print(f"\n  \033[2m[{format_action(fn_name, fn_args)}]\033[0m")
+
+            result = execute_tool(fn_name, fn_args)
+
+            messages.append({
+                "role": "tool",
+                "content": result,
+            })
+
+    print("\n  [max iterations reached]")
+
+
+def handle_command(user_input, messages):
+    parts = user_input.strip().split(None, 1)
+    cmd = parts[0].lower()
+
+    if cmd in ("/quit", "/exit", "/q"):
+        print("Bye.")
+        sys.exit(0)
+    elif cmd == "/clear":
+        messages.clear()
+        messages.append({"role": "system", "content": SYSTEM_PROMPT})
+        print("Conversation cleared.")
+        return True
+    elif cmd == "/model":
+        if len(parts) > 1:
+            global MODEL
+            MODEL = parts[1]
+            print(f"Switched to: {MODEL}")
+        else:
+            print(f"Model: {MODEL}")
+        return True
+    elif cmd == "/help":
+        print("""Commands:
+  /clear        - Clear conversation history
+  /model [name] - Show or switch the model
+  /help         - Show this help
+  /quit         - Exit
+
+Just type what you want. The agent will read, write, and edit files directly.""")
+        return True
+    return False
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: print("\n"))
+
+    cols = shutil.get_terminal_size().columns
+    print(f"\033[1mlocalcode\033[0m ({MODEL})")
+    print(f"Working in: {WORKDIR}")
+    print("-" * min(cols, 50))
+
+    models = check_ollama()
+    if models is None:
+        print("Error: Ollama is not running. Start it with: ollama serve")
+        sys.exit(1)
+
+    if not check_model_available(models):
+        print(f"Pulling {MODEL}...")
+        subprocess.run(["ollama", "pull", MODEL], check=True)
+        print()
+
+    print("Ready. Ask me to generate, edit, or explain code.\n")
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    while True:
+        try:
+            user_input = input("\033[1m> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
+
+        if not user_input.strip():
+            continue
+
+        if user_input.strip().startswith("/"):
+            if handle_command(user_input, messages):
+                continue
+
+        messages.append({"role": "user", "content": user_input})
+        agent_loop(messages)
+        print()
+
+
+if __name__ == "__main__":
+    main()
