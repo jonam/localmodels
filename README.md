@@ -54,6 +54,90 @@ The agent loop: prompt → model decides actions → executes tools → feeds re
 | `/help` | Show commands |
 | `/quit` | Exit |
 
+## Plan System
+
+Turn any project document (PDF, MD, TXT) into a fully executed codebase:
+
+```bash
+./localcode
+> /plan project-spec.pdf    # Sonnet decomposes into 30-60 file-level tasks
+> /plan run                  # QWEN executes tasks one at a time
+```
+
+### Plan Commands
+
+| Command | Description |
+| --- | --- |
+| `/plan <file>` | Create execution plan from a document |
+| `/plan status` | Show progress |
+| `/plan run` | Start/resume task execution |
+| `/plan reconcile` | Manually trigger cross-module analysis |
+| `/plan hint <text>` | Give a fix hint for a failed task |
+| `/plan retry` | Reset failed task and retry |
+| `/plan rollback` | Undo current task's changes |
+| `/plan done N` | Manually mark task N as done |
+| `/plan reset [N]` | Reset task N (or all) to pending |
+| `/plan split` | Break vague tasks into concrete sub-tasks |
+| `/plan nuke` | Tear down infra + delete files + wipe plan |
+
+### Hybrid Architecture: Sonnet + QWEN
+
+The plan system uses a hybrid approach that compensates for local model limitations:
+
+```
+                    ┌─────────────────────────┐
+                    │  Sonnet (via Bedrock)    │
+                    │  • Decomposes PDF → tasks│
+                    │  • Cross-module analysis │
+                    │  • Surgical fix tasks    │
+                    └───────────┬─────────────┘
+                                │
+              ┌─────────────────▼──────────────────┐
+              │         QWEN (local, free)          │
+              │  • Executes 1 task at a time        │
+              │  • Writes/edits exactly 1 file      │
+              │  • Syntax-validated after each task  │
+              └────────────────────────────────────┘
+```
+
+**The problem:** QWEN executes tasks independently with no cross-file visibility. Task 25 might create a Lambda that sends data on port 8080, while task 24 created an EC2 server listening on port 5000.
+
+**The solution — automatic reconciliation:** After all tasks complete, Sonnet reads ALL generated files together and detects:
+- Port mismatches between services
+- API contract disagreements (caller sends X, receiver expects Y)
+- Dead code using deprecated services
+- Duplicate/conflicting implementations
+- Missing imports or environment variables
+- Dependency version issues
+
+Sonnet then emits **surgical fix tasks** with exact old_text → new_text edits that QWEN applies mechanically (no analysis required from the local model).
+
+This cycle repeats automatically until Sonnet reports zero issues:
+
+```
+/plan run
+  └→ QWEN executes tasks 1-60
+  └→ Sonnet reconcile pass 1: finds 12 issues → emits tasks 61-72
+  └→ QWEN executes fix tasks 61-72
+  └→ Sonnet reconcile pass 2: finds 3 issues → emits tasks 73-75
+  └→ QWEN executes fix tasks 73-75
+  └→ Sonnet reconcile pass 3: 0 issues found ✓
+  └→ "Reconciliation complete — all cross-module issues resolved."
+```
+
+### Dependency Detection
+
+When a task produces a file that requires a tool for validation (e.g., `node` for `.js` files, `terraform` for `.tf` files), localcode will prompt you to install it:
+
+```
+  ⚠ 'node' is required to validate .js files but is not installed.
+    Suggested install command: sudo apt install -y nodejs
+
+  Install 'node' now? [Y]es / [n]o (abort plan):
+```
+
+Supports Linux (apt/dnf) and macOS (brew). If declined, the plan halts cleanly and can be resumed after manual installation.
+
 ## Environment
 
 | Variable | Default | Description |
@@ -114,15 +198,27 @@ If you want a Claude Code-like experience with local models, use this `./localco
 ## Limitations
 
 Qwen3-Coder is good at:
-- Generating functions and files
+- Generating functions and files from clear specs
 - Multi-step code modifications
 - Writing tests, scripts, configs
 - Following patterns and conventions
 - Tool use and agentic workflows
-- Parallel function calls
+- Mechanical edits (exact find/replace)
 
-It's weaker at:
+It's weaker at (mitigated by Sonnet reconciliation):
+- ~~Cross-file consistency~~ → caught by reconcile pass
+- ~~Port/contract mismatches~~ → caught by reconcile pass
+- ~~Dead code from conflicting approaches~~ → caught by reconcile pass
 - Very large codebase reasoning (>10 files of context)
 - Complex debugging with many moving parts
 - Ambiguous requirements needing clarification
 - Tasks requiring knowledge beyond training data
+
+## Cost
+
+| Phase | Model | Cost |
+| --- | --- | --- |
+| Plan creation | Sonnet (Bedrock) | ~$0.10-0.30 |
+| Task execution | QWEN (local) | $0 |
+| Reconcile pass | Sonnet (Bedrock) | ~$0.30-0.80 per pass |
+| **Total for ~60 task project** | | **~$1-3** |
