@@ -759,6 +759,53 @@ def verify_tf_references(tf_dir):
     return list(set(errors))  # deduplicate
 
 
+def collect_baseline_errors():
+    """Snapshot all project-wide validation errors BEFORE a task runs.
+
+    Returns a dict keyed by validator name, each value a list of error strings.
+    verify_task compares post-task errors against this to only fail on NEW issues.
+    """
+    baseline = {}
+
+    # --- Terraform: reference checks across all .tf directories ---
+    tf_errors = []
+    tf_dirs_seen = set()
+    for tf_file in glob.glob(os.path.join(WORKDIR, "**", "*.tf"), recursive=True):
+        td = os.path.dirname(tf_file)
+        if td not in tf_dirs_seen and ".terraform" not in td:
+            tf_dirs_seen.add(td)
+            tf_errors.extend(verify_tf_references(td))
+    baseline["terraform"] = tf_errors
+
+    # --- Python: import/syntax checks on all .py files (lightweight) ---
+    # Skipped here — ast.parse is single-file so no cross-file bleed.
+    # If mypy/pyright is added as a project-wide check, add it here.
+
+    # --- TypeScript: tsc project-wide errors ---
+    # Only collect if there's a tsconfig.json (indicates project-wide TS)
+    ts_errors = []
+    for tsconfig in glob.glob(os.path.join(WORKDIR, "**/tsconfig.json"), recursive=True):
+        ts_dir = os.path.dirname(tsconfig)
+        if "node_modules" in ts_dir:
+            continue
+        if shutil.which("npx"):
+            try:
+                result = subprocess.run(
+                    f"cd '{ts_dir}' && npx --yes tsc --noEmit 2>&1 | head -30",
+                    shell=True, capture_output=True, text=True, timeout=30, cwd=WORKDIR
+                )
+                if result.returncode != 0:
+                    for line in (result.stdout or "").strip().splitlines():
+                        if ": error TS" in line:
+                            ts_errors.append(line.strip())
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+        break  # only check the top-level tsconfig
+    baseline["typescript"] = ts_errors
+
+    return baseline
+
+
 class DependencyAbort(Exception):
     """Raised when a required dependency is missing and the user declines to install it."""
     def __init__(self, binary):
@@ -833,7 +880,11 @@ def _prompt_install_dependency(binary, file_ext):
 
 
 def verify_task(task, task_messages):
-    """Verify a task produced working output. Returns (passed, error_message)."""
+    """Verify a task produced working output. Returns (passed, error_message).
+
+    Uses _baseline_errors (set by plan_run before the task) to distinguish
+    pre-existing project-wide errors from new ones this task introduced.
+    """
     # Check if any files were written (via undo history since task mark)
     mark_key = f"task-{task['id']}-start"
     mark_pos = MARKS.get(mark_key, len(UNDO_HISTORY))
@@ -842,14 +893,23 @@ def verify_task(task, task_messages):
     if not files_written:
         return False, "No files were created or modified."
 
+    # Get baseline errors captured before this task ran (set in plan_run)
+    baseline = task.get("_baseline_errors", {})
+    baseline_tf = set(baseline.get("terraform", []))
+    baseline_ts = set(baseline.get("typescript", []))
+
     # Run syntax checks on produced files
     errors = []
+    tf_dirs_checked = set()
+    has_ts_files = False
+
     for fpath in set(files_written):
         if not os.path.isfile(fpath):
             continue
         ext = os.path.splitext(fpath)[1].lower()
         check_cmd = None
         required_bin = None  # binary needed for this check
+
         if ext == ".py":
             check_cmd = f"python3 -c \"import ast; ast.parse(open('{fpath}').read())\""
             required_bin = "python3"
@@ -859,21 +919,25 @@ def verify_task(task, task_messages):
                 check_cmd = f"node --check '{fpath}'"
                 required_bin = "node"
         elif ext in (".jsx", ".tsx"):
-            pass  # JSX/TSX can't be validated without a bundler
+            has_ts_files = True
         elif ext in (".ts",):
+            has_ts_files = True
             check_cmd = f"npx --yes tsc --noEmit --allowJs --skipLibCheck '{fpath}' 2>&1 | head -5"
             required_bin = "npx"
         elif ext == ".tf":
             tf_dir = os.path.dirname(fpath)
+            if tf_dir in tf_dirs_checked:
+                continue
+            tf_dirs_checked.add(tf_dir)
             # Check terraform validate if init'd, else do reference check
             if os.path.isdir(os.path.join(tf_dir, ".terraform")):
                 check_cmd = f"cd '{tf_dir}' && terraform validate 2>&1 | head -10"
                 required_bin = "terraform"
             else:
-                # Lightweight reference check: find all resource refs and verify they're defined
                 tf_errors = verify_tf_references(tf_dir)
-                if tf_errors:
-                    errors.extend(tf_errors)
+                new_tf_errors = [e for e in tf_errors if e not in baseline_tf]
+                if new_tf_errors:
+                    errors.extend(new_tf_errors)
                 continue
 
         if check_cmd:
@@ -891,6 +955,26 @@ def verify_task(task, task_messages):
                     errors.append(f"{os.path.relpath(fpath, WORKDIR)}: {err_text}")
             except (subprocess.TimeoutExpired, Exception):
                 pass
+
+    # For TypeScript: run project-wide check and filter against baseline
+    if has_ts_files:
+        for tsconfig in glob.glob(os.path.join(WORKDIR, "**/tsconfig.json"), recursive=True):
+            ts_dir = os.path.dirname(tsconfig)
+            if "node_modules" in ts_dir:
+                continue
+            if shutil.which("npx"):
+                try:
+                    result = subprocess.run(
+                        f"cd '{ts_dir}' && npx --yes tsc --noEmit 2>&1 | head -30",
+                        shell=True, capture_output=True, text=True, timeout=30, cwd=WORKDIR
+                    )
+                    if result.returncode != 0:
+                        for line in (result.stdout or "").strip().splitlines():
+                            if ": error TS" in line and line.strip() not in baseline_ts:
+                                errors.append(line.strip())
+                except (subprocess.TimeoutExpired, Exception):
+                    pass
+            break
 
     if errors:
         return False, "\n".join(errors)
@@ -1209,6 +1293,9 @@ def plan_run(messages, hint=None):
         # Set mark before each task for rollback (persist to disk for cross-session)
         do_mark(f"task-{task['id']}-start", persist=True)
 
+        # Snapshot pre-existing project-wide errors so verify_task only fails on NEW ones
+        task["_baseline_errors"] = collect_baseline_errors()
+
         # Build context prompt
         done_tasks = [t for t in tasks if t["status"] == "done"]
         done_summary = "\n".join(f"  ✓ {t['id']}. {t['title']}" for t in done_tasks)
@@ -1260,12 +1347,16 @@ RULES (follow strictly):
         try:
             passed, error_msg = verify_task(task, task_messages)
         except DependencyAbort as e:
+            task.pop("_baseline_errors", None)
             plan["current"] = idx
             with open(PLAN_FILE, "w") as f:
                 json.dump(plan, f, indent=2)
             print(f"\n  \033[31m✗ Plan halted: '{e.binary}' is required but not installed.\033[0m")
             print(f"    Install it, then resume with: \033[1m/plan run\033[0m")
             return
+
+        # Clean up transient key so it doesn't pollute the plan JSON
+        task.pop("_baseline_errors", None)
 
         if passed:
             task["status"] = "done"
