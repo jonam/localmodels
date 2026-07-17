@@ -759,6 +759,79 @@ def verify_tf_references(tf_dir):
     return list(set(errors))  # deduplicate
 
 
+class DependencyAbort(Exception):
+    """Raised when a required dependency is missing and the user declines to install it."""
+    def __init__(self, binary):
+        self.binary = binary
+        super().__init__(f"Required dependency '{binary}' not installed — plan halted.")
+
+
+# Install suggestions per binary, per platform
+_INSTALL_HINTS = {
+    "node": {
+        "linux-apt": "sudo apt install -y nodejs",
+        "linux-dnf": "sudo dnf install -y nodejs",
+        "darwin": "brew install node",
+    },
+    "npx": {
+        "linux-apt": "sudo apt install -y nodejs npm",
+        "linux-dnf": "sudo dnf install -y nodejs npm",
+        "darwin": "brew install node",
+    },
+    "python3": {
+        "linux-apt": "sudo apt install -y python3",
+        "linux-dnf": "sudo dnf install -y python3",
+        "darwin": "brew install python3",
+    },
+    "terraform": {
+        "linux-apt": "sudo apt install -y terraform  # or: brew install terraform",
+        "linux-dnf": "sudo dnf install -y terraform",
+        "darwin": "brew install terraform",
+    },
+}
+
+
+def _detect_platform():
+    """Return a key like 'linux-apt', 'linux-dnf', or 'darwin'."""
+    if sys.platform == "darwin":
+        return "darwin"
+    if shutil.which("apt"):
+        return "linux-apt"
+    if shutil.which("dnf"):
+        return "linux-dnf"
+    return "linux-apt"  # fallback
+
+
+def _prompt_install_dependency(binary, file_ext):
+    """Prompt user to install a missing binary. Returns True if installed, False if declined."""
+    platform = _detect_platform()
+    hints = _INSTALL_HINTS.get(binary, {})
+    install_cmd = hints.get(platform, f"# install '{binary}' using your package manager")
+
+    print(f"\n  \033[33m⚠ '{binary}' is required to validate {file_ext} files but is not installed.\033[0m")
+    print(f"    Suggested install command: \033[1m{install_cmd}\033[0m")
+    print()
+
+    while True:
+        try:
+            choice = input(f"  Install '{binary}' now? [Y]es / [n]o (abort plan): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+        if choice in ("y", "yes", ""):
+            print(f"  \033[2mRunning: {install_cmd}\033[0m")
+            ret = subprocess.run(install_cmd, shell=True)
+            if ret.returncode == 0 and shutil.which(binary):
+                print(f"  \033[32m✓ '{binary}' installed successfully.\033[0m\n")
+                return True
+            else:
+                print(f"  \033[31m✗ Installation failed. You may need to install '{binary}' manually.\033[0m")
+                return False
+        elif choice in ("n", "no"):
+            return False
+
+
 def verify_task(task, task_messages):
     """Verify a task produced working output. Returns (passed, error_message)."""
     # Check if any files were written (via undo history since task mark)
@@ -776,21 +849,26 @@ def verify_task(task, task_messages):
             continue
         ext = os.path.splitext(fpath)[1].lower()
         check_cmd = None
+        required_bin = None  # binary needed for this check
         if ext == ".py":
             check_cmd = f"python3 -c \"import ast; ast.parse(open('{fpath}').read())\""
+            required_bin = "python3"
         elif ext in (".js", ".mjs"):
             # Skip node --check for files in frontend/React dirs (JSX/ESM not parseable by Node)
             if "/frontend/" not in fpath and "/src/" not in fpath:
                 check_cmd = f"node --check '{fpath}'"
+                required_bin = "node"
         elif ext in (".jsx", ".tsx"):
             pass  # JSX/TSX can't be validated without a bundler
         elif ext in (".ts",):
             check_cmd = f"npx --yes tsc --noEmit --allowJs --skipLibCheck '{fpath}' 2>&1 | head -5"
+            required_bin = "npx"
         elif ext == ".tf":
             tf_dir = os.path.dirname(fpath)
             # Check terraform validate if init'd, else do reference check
             if os.path.isdir(os.path.join(tf_dir, ".terraform")):
                 check_cmd = f"cd '{tf_dir}' && terraform validate 2>&1 | head -10"
+                required_bin = "terraform"
             else:
                 # Lightweight reference check: find all resource refs and verify they're defined
                 tf_errors = verify_tf_references(tf_dir)
@@ -799,6 +877,10 @@ def verify_task(task, task_messages):
                 continue
 
         if check_cmd:
+            # Check if the required binary is available before running
+            if required_bin and not shutil.which(required_bin):
+                if not _prompt_install_dependency(required_bin, ext):
+                    raise DependencyAbort(required_bin)
             try:
                 result = subprocess.run(
                     check_cmd, shell=True, capture_output=True, text=True,
@@ -1176,7 +1258,15 @@ RULES (follow strictly):
 
         # Verify the task succeeded (do this BEFORE checking interrupt,
         # so completed work is never lost)
-        passed, error_msg = verify_task(task, task_messages)
+        try:
+            passed, error_msg = verify_task(task, task_messages)
+        except DependencyAbort as e:
+            plan["current"] = idx
+            with open(PLAN_FILE, "w") as f:
+                json.dump(plan, f, indent=2)
+            print(f"\n  \033[31m✗ Plan halted: '{e.binary}' is required but not installed.\033[0m")
+            print(f"    Install it, then resume with: \033[1m/plan run\033[0m")
+            return
 
         if passed:
             task["status"] = "done"
