@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local code generation agent powered by Ollama + Qwen2.5-Coder.
+"""Local code generation agent powered by Ollama + Qwen3-Coder.
 Reads, writes, edits files, and runs commands - like Claude Code but local."""
 
 import sys
@@ -13,10 +13,136 @@ import readline
 import shutil
 import glob
 import re
+import threading
+import termios
+import tty
+import select
+from collections import deque
 
-MODEL = os.environ.get("LOCALCODE_MODEL", "qwen2.5-coder:7b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 WORKDIR = os.getcwd()
+
+# Undo history: list of (path, old_content_or_None) tuples
+# Marks: list of (name, index_into_history) for checkpoint rollback
+UNDO_HISTORY = []
+MARKS = {}
+MAX_UNDO = 200
+
+# Async control
+INPUT_QUEUE = deque()       # queued prompts for next turn
+INJECT_QUEUE = deque()      # messages to inject into current running task
+INTERRUPTED = threading.Event()
+AGENT_RUNNING = threading.Event()  # set while agent_loop is active
+
+# Token/cost tracking
+import time
+
+STATS = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "requests": 0,
+    "start_time": None,
+    "last_request_duration": 0,
+}
+
+# Approximate pricing for equivalent Claude API usage (Sonnet 4.6 rates)
+CLAUDE_INPUT_COST_PER_M = 3.00
+CLAUDE_OUTPUT_COST_PER_M = 15.00
+
+
+def estimate_tokens(text):
+    """Rough token count: ~4 chars per token for English/code."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds) // 60
+    secs = seconds - minutes * 60
+    return f"{minutes}m{secs:.0f}s"
+
+
+def format_tokens(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+
+def print_stats_line(duration):
+    """Print a session summary line after each agent_loop completes."""
+    saved = (STATS["input_tokens"] * CLAUDE_INPUT_COST_PER_M +
+             STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+    total_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
+    print(f"\n  \033[2m━━━ {format_duration(duration)} total │ "
+          f"↑{format_tokens(STATS['input_tokens'])} ↓{format_tokens(STATS['output_tokens'])} cumulative │ "
+          f"\033[32m${saved:.2f} saved\033[0m\033[2m │ "
+          f"session {format_duration(total_time)} ━━━\033[0m\n")
+
+
+class InterruptedError(Exception):
+    pass
+
+
+def watch_for_input():
+    """Monitor stdin for ESC/Ctrl+C to interrupt while model is generating."""
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        return
+    try:
+        tty.setraw(fd)
+        while not INTERRUPTED.is_set():
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                ch = sys.stdin.read(1)
+                if ch == '\x1b':  # ESC
+                    INTERRUPTED.set()
+                    break
+                elif ch == '\x03':  # Ctrl+C
+                    INTERRUPTED.set()
+                    break
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except termios.error:
+            pass
+
+
+def detect_best_model():
+    """Pick the best model based on available system RAM.
+    Prefers Qwen3-Coder (MoE) which has only 3B active params but 30B quality."""
+    explicit = os.environ.get("LOCALCODE_MODEL")
+    if explicit:
+        return explicit
+
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    ram_gb = int(line.split()[1]) // (1024 * 1024)
+                    break
+            else:
+                ram_gb = 8
+    except (FileNotFoundError, ValueError):
+        ram_gb = 8
+
+    if ram_gb >= 32:
+        return "qwen3-coder:30b"
+    elif ram_gb >= 16:
+        return "qwen3:14b"
+    else:
+        return "qwen3:8b"
+
+
+MODEL = detect_best_model()
+FAST_MODEL = os.environ.get("LOCALCODE_FAST_MODEL", "qwen3:8b")
 
 TOOLS = [
     {
@@ -178,26 +304,1352 @@ def resolve_path(path):
     return os.path.normpath(os.path.join(WORKDIR, path))
 
 
+def read_pdf(path):
+    """Extract text from a PDF using pdftotext (poppler) or fallback to raw extraction."""
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", path, "-"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            text = result.stdout
+            lines = text.split("\n")
+            if len(lines) > 500:
+                return f"[PDF: {len(lines)} lines, showing first 500]\n" + "\n".join(lines[:500])
+            return text
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fallback: basic text extraction from PDF binary
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        import zlib
+        text_chunks = []
+        # Extract text between BT/ET markers in PDF streams
+        i = 0
+        while i < len(raw):
+            stream_start = raw.find(b"stream\r\n", i)
+            if stream_start == -1:
+                stream_start = raw.find(b"stream\n", i)
+            if stream_start == -1:
+                break
+            stream_start = raw.index(b"\n", stream_start) + 1
+            stream_end = raw.find(b"endstream", stream_start)
+            if stream_end == -1:
+                break
+            stream_data = raw[stream_start:stream_end]
+            try:
+                stream_data = zlib.decompress(stream_data)
+            except zlib.error:
+                pass
+            # Extract parenthesized strings (PDF text objects)
+            for match in re.finditer(rb'\(([^)]+)\)', stream_data):
+                try:
+                    text_chunks.append(match.group(1).decode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
+            i = stream_end + 9
+        if text_chunks:
+            return " ".join(text_chunks)[:10000]
+    except Exception:
+        pass
+
+    return f"Error: Cannot extract text from PDF. Install poppler-utils: sudo apt install poppler-utils"
+
+
+def save_undo(path):
+    """Save current file state to undo history before modifying it."""
+    try:
+        with open(path) as f:
+            old_content = f.read()
+    except FileNotFoundError:
+        old_content = None
+    UNDO_HISTORY.append((path, old_content))
+    if len(UNDO_HISTORY) > MAX_UNDO:
+        UNDO_HISTORY.pop(0)
+    if AGENT_RUNNING.is_set() and os.path.isfile(PLAN_FILE):
+        save_snapshots()
+
+
+def do_undo(count=1):
+    """Undo the last N file changes."""
+    if not UNDO_HISTORY:
+        print("Nothing to undo.")
+        return
+    count = min(count, len(UNDO_HISTORY))
+    for _ in range(count):
+        path, old_content = UNDO_HISTORY.pop()
+        if old_content is None:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"  \033[31m✗ deleted: {os.path.relpath(path, WORKDIR)}\033[0m")
+        else:
+            with open(path, "w") as f:
+                f.write(old_content)
+            print(f"  \033[33m↺ restored: {os.path.relpath(path, WORKDIR)}\033[0m")
+    print(f"  Undid {count} change(s). ({len(UNDO_HISTORY)} remaining in history)")
+
+
+def do_mark(name, persist=False):
+    """Save a named checkpoint at current position in history."""
+    MARKS[name] = len(UNDO_HISTORY)
+    print(f"  \033[36m# mark set: {name} (at change {len(UNDO_HISTORY)})\033[0m")
+    if persist:
+        save_snapshots()
+
+
+def do_rollback(name):
+    """Rollback all changes since a named mark."""
+    if name not in MARKS:
+        available = ", ".join(MARKS.keys()) if MARKS else "none"
+        print(f"  Mark '{name}' not found. Available: {available}")
+        return
+    target = MARKS[name]
+    count = len(UNDO_HISTORY) - target
+    if count <= 0:
+        print(f"  No changes since mark '{name}'.")
+        return
+    print(f"  Rolling back {count} change(s) to mark '{name}'...")
+    # Collect unique files and their original state at the mark point
+    # We need to restore each file to what it was at the mark, not step-by-step
+    file_states = {}
+    for path, old_content in reversed(UNDO_HISTORY[target:]):
+        if path not in file_states:
+            file_states[path] = old_content
+    for path, old_content in file_states.items():
+        if old_content is None:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"  \033[31m✗ deleted: {os.path.relpath(path, WORKDIR)}\033[0m")
+        else:
+            with open(path, "w") as f:
+                f.write(old_content)
+            print(f"  \033[33m↺ restored: {os.path.relpath(path, WORKDIR)}\033[0m")
+    del UNDO_HISTORY[target:]
+    # Remove marks that were set after this one
+    stale = [k for k, v in MARKS.items() if v > target]
+    for k in stale:
+        del MARKS[k]
+    print(f"  Rolled back to '{name}'. ({len(UNDO_HISTORY)} changes in history)")
+
+
+# ─── Plan System: orchestrate multi-task execution from documents ─────────────
+
+PLAN_DIR = os.path.join(WORKDIR, ".localcode")
+PLAN_FILE = os.path.join(PLAN_DIR, "plan.json")
+SNAPSHOTS_FILE = os.path.join(PLAN_DIR, "snapshots.json")
+
+
+def save_snapshots():
+    """Persist undo history and marks to disk for cross-session rollback."""
+    data = {
+        "marks": MARKS,
+        "history": [(path, content) for path, content in UNDO_HISTORY],
+    }
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    with open(SNAPSHOTS_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def load_snapshots():
+    """Restore undo history and marks from disk on startup."""
+    if not os.path.isfile(SNAPSHOTS_FILE):
+        return
+    try:
+        with open(SNAPSHOTS_FILE) as f:
+            data = json.load(f)
+        MARKS.update(data.get("marks", {}))
+        for path, content in data.get("history", []):
+            UNDO_HISTORY.append((path, content))
+    except (json.JSONDecodeError, IOError, KeyError):
+        pass
+
+
+def parse_tasks_regex(text):
+    """Extract tasks from structured text using regex. Returns list of task dicts."""
+    tasks = []
+
+    # Pattern 1: Numbered items with period (1. Do something)
+    numbered = re.findall(r'^\s*(\d+)\.\s+(.+?)$', text, re.MULTILINE)
+    if len(numbered) >= 3:
+        for num, title in numbered:
+            tasks.append({"id": int(num), "title": title.strip(), "status": "pending"})
+        return tasks
+
+    # Pattern 2: Checkboxes (□, - [ ], * [ ])
+    checkboxes = re.findall(r'^\s*(?:□|[\-\*]\s*\[[ x]\])\s+(.+?)$', text, re.MULTILINE)
+    if len(checkboxes) >= 3:
+        for i, title in enumerate(checkboxes, 1):
+            tasks.append({"id": i, "title": title.strip(), "status": "pending"})
+        return tasks
+
+    # Pattern 3: "Week N" or "Stage N" sections with sub-items
+    sections = re.split(r'\n(?=(?:Week|Stage|Phase|Step)\s+\d)', text, flags=re.IGNORECASE)
+    if len(sections) >= 2:
+        task_id = 0
+        for section in sections:
+            header_match = re.match(r'((?:Week|Stage|Phase|Step)\s+\d[^:\n]*):?\s*', section, re.IGNORECASE)
+            # Find numbered or bulleted items within this section
+            items = re.findall(r'^\s*(?:\d+\.|[\-\*•])\s+(.+?)$', section, re.MULTILINE)
+            if items:
+                for item in items:
+                    task_id += 1
+                    group = header_match.group(1).strip() if header_match else ""
+                    tasks.append({"id": task_id, "title": item.strip(), "group": group, "status": "pending"})
+            elif header_match:
+                # Section without sub-items — treat the section itself as a task
+                task_id += 1
+                body = section[header_match.end():].strip().split("\n")[0]
+                tasks.append({"id": task_id, "title": body or header_match.group(1).strip(), "status": "pending"})
+        if tasks:
+            return tasks
+
+    # Pattern 4: Markdown headers (## Section)
+    headers = re.findall(r'^#{1,3}\s+(.+?)$', text, re.MULTILINE)
+    # Filter out generic headers
+    skip = {"overview", "background", "resources", "future", "technical details", "getting started", "requirements"}
+    headers = [h for h in headers if h.lower().strip() not in skip and len(h) > 5]
+    if len(headers) >= 3:
+        for i, title in enumerate(headers, 1):
+            tasks.append({"id": i, "title": title.strip(), "status": "pending"})
+        return tasks
+
+    return tasks
+
+
+def parse_tasks_with_model(text):
+    """Use the local model to break down a document into tasks."""
+    prompt = f"""Analyze this project document and break it into a numbered list of implementation tasks.
+Each task should be a concrete coding/building step that can be done independently.
+Output ONLY a JSON array like: [{{"id": 1, "title": "...", "depends_on": []}}, ...]
+
+The depends_on field should list task IDs that must be completed first.
+Keep task titles short (under 80 chars). Aim for 5-20 tasks.
+
+Document:
+{text[:12000]}"""
+
+    messages = [
+        {"role": "system", "content": "You output valid JSON only. No markdown, no explanation."},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        response = call_ollama(messages)
+        content = response.get("message", {}).get("content", "")
+        # Extract JSON from response
+        content = re.sub(r'^```(?:json)?\s*', '', content.strip())
+        content = re.sub(r'```\s*$', '', content.strip())
+        tasks = json.loads(content)
+        if isinstance(tasks, list) and len(tasks) >= 2:
+            for t in tasks:
+                t.setdefault("status", "pending")
+                t.setdefault("depends_on", [])
+            return tasks
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"  \033[31mModel failed to parse tasks: {e}\033[0m")
+
+    return []
+
+
+def plan_create(source_path):
+    """Parse a document and create a plan file."""
+    path = resolve_path(source_path)
+    if not os.path.isfile(path):
+        print(f"  File not found: {source_path}")
+        return False
+
+    # Read content
+    if path.lower().endswith(".pdf"):
+        text = read_pdf(path)
+        if text.startswith("Error:"):
+            print(f"  {text}")
+            return False
+    else:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except Exception as e:
+            print(f"  Cannot read file: {e}")
+            return False
+
+    print(f"  \033[2mParsing tasks from: {source_path}\033[0m")
+    tasks = []
+
+    # Gather existing file list for context
+    file_list = []
+    for root, dirs, files in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if d not in (".localcode", "node_modules", ".terraform", ".git", "__pycache__")]
+        for f in files:
+            file_list.append(os.path.relpath(os.path.join(root, f), WORKDIR))
+    file_context = "\n".join(file_list[:50])
+
+    # Try Claude Haiku (Bedrock) — produces concrete file-level tasks directly
+    has_claude = bool(os.environ.get("AWS_ACCESS_KEY_ID") or os.path.isfile(os.path.expanduser("~/.aws/credentials")))
+    if has_claude:
+        print(f"  \033[2mUsing Claude Sonnet (Bedrock) to create execution plan...\033[0m")
+        parse_prompt = f"""Analyze this project document and break it into the SMALLEST possible concrete implementation sub-tasks for a local coding agent (Qwen3-Coder-30B running on CPU) to execute one at a time.
+
+CRITICAL CONSTRAINTS on the executing model:
+- It is SLOW (60-120s per response) and has limited context
+- It must complete each task in under 5 minutes wall-clock
+- It has tools: read_file, write_file, edit_file, run_command, list_files, search_files
+- It runs ONE task at a time with no memory between tasks
+- Project files are pre-loaded into its context, so it should NOT need to read them again
+
+Each sub-task MUST:
+- Touch EXACTLY 1 file (never 2+)
+- Be completable in 2-4 tool calls (ideally: 1 read + 1 write, or just 1 write)
+- Name the EXACT file path and EXACT action in the title
+- Specify what the file should contain or what change to make
+- Have a single clear deliverable
+
+Existing project files:
+{file_context}
+
+Project document:
+{text[:12000]}
+
+Output ONLY a JSON array. Format:
+[{{"id": 1, "title": "Create terraform/lambda/enroll.py — Lambda handler that calls VoiceID CreateSpeaker with audio from S3", "depends_on": []}}, ...]
+
+Rules:
+- Title format: "ACTION path/to/file.ext — WHAT_IT_DOES_SPECIFICALLY"
+- ONE file per task, no exceptions
+- If a feature needs a Lambda + its Terraform resource + its IAM policy, that's 3 separate tasks
+- Prefer more smaller tasks over fewer larger ones (30-60 tasks is fine)
+- depends_on lists task IDs that must complete first
+- Keep IDs sequential starting from 1
+- Each title should be specific enough that a developer could implement it without reading the source document"""
+        response = call_claude_api(parse_prompt)
+        if response:
+            try:
+                cleaned = re.sub(r'^```(?:json)?\s*', '', response.strip())
+                cleaned = re.sub(r'```\s*$', '', cleaned.strip())
+                tasks = json.loads(cleaned)
+                if isinstance(tasks, list) and len(tasks) >= 2:
+                    for t in tasks:
+                        t.setdefault("status", "pending")
+                        t.setdefault("depends_on", [])
+                    print(f"  \033[32m✓ Claude Sonnet created {len(tasks)} concrete sub-tasks\033[0m")
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"  \033[33m⚠ Failed to parse Sonnet response: {e}\033[0m")
+                print(f"  \033[2mResponse preview: {response[:200]}\033[0m")
+                tasks = []
+        else:
+            print(f"  \033[33m⚠ Bedrock returned no response\033[0m")
+
+    # Fallback: regex parse then local model
+    if not tasks:
+        tasks = parse_tasks_regex(text)
+        if tasks:
+            print(f"  \033[32m✓ Found {len(tasks)} tasks via document structure\033[0m")
+
+    if not tasks:
+        print(f"  \033[2mUsing local model to break it down...\033[0m")
+        tasks = parse_tasks_with_model(text)
+        if tasks:
+            print(f"  \033[32m✓ Model identified {len(tasks)} tasks\033[0m")
+
+    if not tasks:
+        print(f"  \033[31m✗ Could not extract tasks from document.\033[0m")
+        return False
+
+    # Save plan
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    plan = {
+        "source": source_path,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "current": 0,
+        "tasks": tasks,
+        "document_summary": text[:3000],
+    }
+    with open(PLAN_FILE, "w") as f:
+        json.dump(plan, f, indent=2)
+
+    # Display
+    print(f"\n  \033[1mPlan: {len(tasks)} tasks\033[0m")
+    bar_width = min(shutil.get_terminal_size().columns - 8, 60)
+    print(f"  {'─' * bar_width}")
+    for t in tasks:
+        deps = f" (after: {t['depends_on']})" if t.get("depends_on") else ""
+        group = f" [{t['group']}]" if t.get("group") else ""
+        print(f"  {t['id']:3d}. {t['title']}{group}{deps}")
+    print(f"  {'─' * bar_width}")
+    print(f"\n  Saved to: .localcode/plan.json")
+    print(f"  Run \033[1m/plan run\033[0m to start executing, or \033[1m/plan edit\033[0m to adjust.")
+    return True
+
+
+def plan_load():
+    """Load existing plan or return None."""
+    if not os.path.isfile(PLAN_FILE):
+        return None
+    try:
+        with open(PLAN_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def plan_status():
+    """Show current plan status."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found. Use /plan <file> to create one.")
+        return
+
+    tasks = plan["tasks"]
+    done = sum(1 for t in tasks if t["status"] == "done")
+    total = len(tasks)
+    current = plan.get("current", 0)
+    bar_width = min(shutil.get_terminal_size().columns - 8, 60)
+
+    # Progress bar
+    filled = int(bar_width * done / total) if total else 0
+    bar = "█" * filled + "░" * (bar_width - filled)
+    print(f"\n  \033[1mPlan: {plan.get('source', 'unknown')}\033[0m")
+    print(f"  [{bar}] {done}/{total}")
+    print(f"  {'─' * bar_width}")
+    for t in tasks:
+        if t["status"] == "done":
+            icon = "\033[32m✓\033[0m"
+        elif t["id"] == current + 1:
+            icon = "\033[33m▶\033[0m"
+        else:
+            icon = "\033[2m○\033[0m"
+        print(f"  {icon} {t['id']:3d}. {t['title']}")
+    print(f"  {'─' * bar_width}")
+
+
+MAX_RETRIES = 3
+
+
+def verify_tf_references(tf_dir):
+    """Check .tf files for references to resources that don't exist. No terraform init needed."""
+    import re
+    errors = []
+    # Collect all .tf file content in the directory
+    tf_content = ""
+    tf_files = [f for f in os.listdir(tf_dir) if f.endswith(".tf")]
+    for fname in tf_files:
+        with open(os.path.join(tf_dir, fname), "r") as f:
+            tf_content += f.read() + "\n"
+
+    # Find all defined resources: resource "type" "name"
+    defined = set()
+    for m in re.finditer(r'resource\s+"(\w+)"\s+"(\w+)"', tf_content):
+        defined.add(f"{m.group(1)}.{m.group(2)}")
+    # Also data sources: data "type" "name"
+    for m in re.finditer(r'data\s+"(\w+)"\s+"(\w+)"', tf_content):
+        defined.add(f"data.{m.group(1)}.{m.group(2)}")
+
+    # Find all references to resources (type.name.attribute)
+    # Pattern: aws_something.name.attribute (not inside quotes defining a resource)
+    ref_pattern = re.compile(r'(?<!resource ")(?<!data ")(aws_\w+)\.(\w+)\.(\w+)')
+    for m in ref_pattern.finditer(tf_content):
+        ref_type = m.group(1)
+        ref_name = m.group(2)
+        ref_key = f"{ref_type}.{ref_name}"
+        data_key = f"data.{ref_type}.{ref_name}"
+        if ref_key not in defined and data_key not in defined:
+            errors.append(f"terraform: reference to undeclared resource \"{ref_type}\" \"{ref_name}\"")
+
+    return list(set(errors))  # deduplicate
+
+
+def verify_task(task, task_messages):
+    """Verify a task produced working output. Returns (passed, error_message)."""
+    # Check if any files were written (via undo history since task mark)
+    mark_key = f"task-{task['id']}-start"
+    mark_pos = MARKS.get(mark_key, len(UNDO_HISTORY))
+    files_written = [path for path, _ in UNDO_HISTORY[mark_pos:]]
+
+    if not files_written:
+        return False, "No files were created or modified."
+
+    # Run syntax checks on produced files
+    errors = []
+    for fpath in set(files_written):
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fpath)[1].lower()
+        check_cmd = None
+        if ext == ".py":
+            check_cmd = f"python3 -c \"import ast; ast.parse(open('{fpath}').read())\""
+        elif ext in (".js", ".mjs"):
+            # Skip node --check for files in frontend/React dirs (JSX/ESM not parseable by Node)
+            if "/frontend/" not in fpath and "/src/" not in fpath:
+                check_cmd = f"node --check '{fpath}'"
+        elif ext in (".jsx", ".tsx"):
+            pass  # JSX/TSX can't be validated without a bundler
+        elif ext in (".ts",):
+            check_cmd = f"npx --yes tsc --noEmit --allowJs --skipLibCheck '{fpath}' 2>&1 | head -5"
+        elif ext == ".tf":
+            tf_dir = os.path.dirname(fpath)
+            # Check terraform validate if init'd, else do reference check
+            if os.path.isdir(os.path.join(tf_dir, ".terraform")):
+                check_cmd = f"cd '{tf_dir}' && terraform validate 2>&1 | head -10"
+            else:
+                # Lightweight reference check: find all resource refs and verify they're defined
+                tf_errors = verify_tf_references(tf_dir)
+                if tf_errors:
+                    errors.extend(tf_errors)
+                continue
+
+        if check_cmd:
+            try:
+                result = subprocess.run(
+                    check_cmd, shell=True, capture_output=True, text=True,
+                    timeout=15, cwd=WORKDIR
+                )
+                if result.returncode != 0:
+                    err_text = (result.stderr or result.stdout or "").strip()[:500]
+                    errors.append(f"{os.path.relpath(fpath, WORKDIR)}: {err_text}")
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
+    if errors:
+        return False, "\n".join(errors)
+
+    # Check if the last agent response indicated failure
+    for msg in reversed(task_messages):
+        if msg.get("role") == "assistant" or msg.get("role") == "tool":
+            content = msg.get("content", "")
+            if any(phrase in content.lower() for phrase in ["error:", "failed", "cannot", "unable to"]):
+                # Only count it as failure if it was the final message
+                if msg == task_messages[-1] or msg == task_messages[-2]:
+                    return False, f"Agent reported issue: {content[:200]}"
+            break
+
+    return True, ""
+
+
+def call_claude_api(prompt):
+    """Call Claude Haiku via AWS Bedrock for plan splitting. Fast and cheap.
+    Uses AWS credentials from env. Falls back to claude CLI. Returns text or None."""
+    import hashlib
+    import hmac as hmac_mod
+    import datetime
+
+    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+
+    # Read from ~/.aws/credentials if env vars not set
+    if not access_key or not secret_key:
+        creds_file = os.path.expanduser("~/.aws/credentials")
+        if os.path.isfile(creds_file):
+            import configparser
+            config = configparser.ConfigParser()
+            config.read(creds_file)
+            profile = os.environ.get("AWS_PROFILE", "default")
+            if profile in config:
+                access_key = access_key or config[profile].get("aws_access_key_id", "")
+                secret_key = secret_key or config[profile].get("aws_secret_access_key", "")
+        # Also check ~/.aws/config for region
+        config_file = os.path.expanduser("~/.aws/config")
+        if os.path.isfile(config_file):
+            import configparser
+            cfg = configparser.ConfigParser()
+            cfg.read(config_file)
+            profile_section = "default" if os.environ.get("AWS_PROFILE", "default") == "default" else f"profile {os.environ.get('AWS_PROFILE', 'default')}"
+            if profile_section in cfg:
+                region = cfg[profile_section].get("region", region)
+
+    model_id = os.environ.get("LOCALCODE_CLAUDE_MODEL", "us.anthropic.claude-sonnet-4-6")
+
+    if access_key and secret_key:
+        try:
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}],
+                "system": "You output valid JSON only. No markdown, no explanation, no thinking tags."
+            }).encode()
+
+            host = f"bedrock-runtime.{region}.amazonaws.com"
+            uri_path = f"/model/{urllib.parse.quote(model_id, safe='')}/invoke"
+            # SigV4 requires double-encoding for canonical URI
+            canonical_uri = f"/model/{urllib.parse.quote(urllib.parse.quote(model_id, safe=''), safe='/')}/invoke"
+            endpoint = f"https://{host}{uri_path}"
+            now = datetime.datetime.utcnow()
+            datestamp = now.strftime("%Y%m%d")
+            amzdate = now.strftime("%Y%m%dT%H%M%SZ")
+
+            service = "bedrock"
+            credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+            payload_hash = hashlib.sha256(body).hexdigest()
+
+            canonical_headers = f"content-type:application/json\nhost:{host}\nx-amz-date:{amzdate}\n"
+            signed_headers = "content-type;host;x-amz-date"
+            canonical_request = f"POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+            string_to_sign = (
+                f"AWS4-HMAC-SHA256\n{amzdate}\n{credential_scope}\n"
+                f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+            )
+
+            # Derive signing key
+            k_date = hmac_mod.new(("AWS4" + secret_key).encode("utf-8"), datestamp.encode("utf-8"), hashlib.sha256).digest()
+            k_region = hmac_mod.new(k_date, region.encode("utf-8"), hashlib.sha256).digest()
+            k_service = hmac_mod.new(k_region, service.encode("utf-8"), hashlib.sha256).digest()
+            signing_key = hmac_mod.new(k_service, b"aws4_request", hashlib.sha256).digest()
+
+            signature = hmac_mod.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+            auth_header = (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+                f"SignedHeaders={signed_headers}, Signature={signature}"
+            )
+
+            req = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Amz-Date": amzdate,
+                    "Authorization": auth_header,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+                text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+                if text_blocks:
+                    return "\n".join(text_blocks)
+        except Exception as e:
+            print(f"  \033[33m⚠ Bedrock API error: {e}\033[0m")
+
+    return None
+
+
+def plan_split():
+    """Split vague plan tasks into concrete file-level sub-tasks. Uses Claude if available, falls back to Qwen."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found. Use /plan <file> to create one.")
+        return
+
+    tasks = plan["tasks"]
+    pending = [t for t in tasks if t["status"] == "pending"]
+    if not pending:
+        print("  All tasks are done or failed — nothing to split.")
+        return
+
+    # Gather existing file list for context
+    file_list = []
+    for root, dirs, files in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if d not in (".localcode", "node_modules", ".terraform", ".git", "__pycache__")]
+        for f in files:
+            file_list.append(os.path.relpath(os.path.join(root, f), WORKDIR))
+
+    file_context = "\n".join(file_list[:50])
+
+    tasks_json = json.dumps([{"id": t["id"], "title": t["title"]} for t in pending], indent=2)
+    split_prompt = f"""Break these plan tasks into the SMALLEST possible concrete sub-tasks for a local coding agent (Qwen3-Coder-30B running on CPU) to execute one at a time.
+
+CRITICAL CONSTRAINTS on the executing model:
+- It is SLOW (60-120s per response) and has limited context
+- It must complete each task in under 5 minutes wall-clock
+- It has tools: read_file, write_file, edit_file, run_command, list_files, search_files
+- It runs ONE task at a time with no memory between tasks
+- Project files are pre-loaded into its context, so it should NOT need to read them again
+
+Each sub-task MUST:
+- Touch EXACTLY 1 file (never 2+)
+- Be completable in 2-4 tool calls (ideally: 1 read + 1 write, or just 1 write)
+- Name the EXACT file path and EXACT action in the title
+- Specify what the file should contain or what change to make
+- Have a single clear deliverable
+
+Existing project files:
+{file_context}
+
+Project context (from source document):
+{plan.get('document_summary', '')[:3000]}
+
+Tasks to split:
+{tasks_json}
+
+Output ONLY a JSON array. Format:
+[{{"id": 1, "title": "Create terraform/lambda/enroll.py — Lambda handler that calls VoiceID CreateSpeaker with audio from S3", "depends_on": []}}]
+
+Rules:
+- Title format: "ACTION path/to/file.ext — WHAT_IT_DOES_SPECIFICALLY"
+- ONE file per task, no exceptions
+- If a feature needs a Lambda + its Terraform resource + its IAM policy, that's 3 separate tasks
+- Prefer more smaller tasks over fewer larger ones (30-60 tasks is fine)
+- depends_on lists task IDs that must complete first
+- Keep IDs sequential starting from 1
+- Each title should be specific enough that a developer could implement it without reading the source document
+- Preserve logical dependencies between groups"""
+
+    # Try Claude first (fast, smart — one Sonnet API call)
+    has_claude = bool(os.environ.get("AWS_ACCESS_KEY_ID") or os.path.isfile(os.path.expanduser("~/.aws/credentials")))
+    content = None
+
+    if has_claude:
+        print(f"  \033[2mUsing Claude Sonnet (Bedrock) for intelligent task splitting...\033[0m")
+        content = call_claude_api(split_prompt)
+        if content:
+            print(f"  \033[32m✓ Claude Sonnet responded\033[0m")
+        else:
+            print(f"  \033[33m⚠ Bedrock unavailable — falling back to local model\033[0m")
+
+    # Fall back to local model
+    if not content:
+        print(f"  \033[2mUsing {MODEL} for task splitting (slower but works offline)...\033[0m")
+        messages = [
+            {"role": "system", "content": "You output valid JSON only. No markdown, no explanation."},
+            {"role": "user", "content": split_prompt},
+        ]
+        try:
+            response = call_ollama(messages)
+            content = response.get("message", {}).get("content", "")
+        except Exception as e:
+            print(f"  \033[31m✗ Failed: {e}\033[0m")
+            return
+
+    # Parse the response
+    try:
+        content = re.sub(r'^```(?:json)?\s*', '', content.strip())
+        content = re.sub(r'```\s*$', '', content.strip())
+        content = re.sub(r'</?(?:think|no_think)>', '', content).strip()
+        new_tasks = json.loads(content)
+
+        if not isinstance(new_tasks, list) or len(new_tasks) < len(pending):
+            print(f"  \033[31m✗ Got {len(new_tasks) if isinstance(new_tasks, list) else 0} tasks — expected at least {len(pending)}. Try again.\033[0m")
+            return
+
+        for t in new_tasks:
+            t.setdefault("status", "pending")
+            t.setdefault("depends_on", [])
+
+        # Preserve done tasks from original plan
+        done_tasks = [t for t in tasks if t["status"] == "done"]
+        final_tasks = []
+        for i, t in enumerate(done_tasks, 1):
+            t["id"] = i
+            final_tasks.append(t)
+        for i, t in enumerate(new_tasks, len(done_tasks) + 1):
+            t["id"] = i
+            t["status"] = "pending"
+            final_tasks.append(t)
+
+        plan["tasks"] = final_tasks
+        with open(PLAN_FILE, "w") as f:
+            json.dump(plan, f, indent=2)
+
+        print(f"  \033[32m✓ Split into {len(final_tasks)} tasks ({len(done_tasks)} done + {len(new_tasks)} new)\033[0m")
+        bar_width = min(shutil.get_terminal_size().columns - 8, 60)
+        print(f"  {'─' * bar_width}")
+        for t in final_tasks:
+            icon = "\033[32m✓\033[0m" if t["status"] == "done" else "\033[2m○\033[0m"
+            print(f"  {icon} {t['id']:3d}. {t['title']}")
+        print(f"  {'─' * bar_width}")
+        print(f"\n  Run \033[1m/plan run\033[0m to start, or \033[1m/plan\033[0m to review.")
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"  \033[31m✗ Failed to parse tasks: {e}\033[0m")
+        if content:
+            print(f"  \033[2mRaw output (first 500 chars): {content[:500]}\033[0m")
+
+
+def plan_run(messages, hint=None):
+    """Execute plan tasks sequentially with verify-retry loop."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found. Use /plan <file> to create one.")
+        return
+
+    tasks = plan["tasks"]
+    total = len(tasks)
+    start_from = plan.get("current", 0)
+
+    # Pre-read key project files once to inject into all sub-tasks
+    project_context_files = ""
+    context_size = 0
+    MAX_CONTEXT = 6000  # chars to inject (keeps room for task prompt within context window)
+    for pattern in ["*.tf", "*.json", "*.yaml", "*.yml", "*.toml"]:
+        for fpath in sorted(glob.glob(os.path.join(WORKDIR, "**", pattern), recursive=True)):
+            if ".localcode" in fpath or "node_modules" in fpath or ".terraform" in fpath:
+                continue
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+                if context_size + len(content) > MAX_CONTEXT:
+                    continue
+                rel = os.path.relpath(fpath, WORKDIR)
+                project_context_files += f"\n--- {rel} ---\n{content}\n"
+                context_size += len(content)
+            except (IOError, UnicodeDecodeError):
+                pass
+    # Also grab top-level source files
+    for pattern in ["*.py", "*.js", "*.ts", "*.tsx"]:
+        for fpath in sorted(glob.glob(os.path.join(WORKDIR, pattern))):
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+                if context_size + len(content) > MAX_CONTEXT:
+                    continue
+                rel = os.path.relpath(fpath, WORKDIR)
+                project_context_files += f"\n--- {rel} ---\n{content}\n"
+                context_size += len(content)
+            except (IOError, UnicodeDecodeError):
+                pass
+
+    if project_context_files:
+        print(f"  \033[2mPre-loaded {context_size // 1000}k chars of project files into context\033[0m")
+
+    # Find next pending/failed task
+    idx = start_from
+    while idx < total:
+        task = tasks[idx]
+        if task["status"] == "done":
+            idx += 1
+            continue
+
+        # A failed task blocks everything — must fix it before moving on
+        if task["status"] == "failed" and not hint:
+            print(f"\n  \033[31m✗ Task {task['id']} is blocked (failed).\033[0m")
+            print(f"    Last error: {task.get('last_error', 'unknown')[:200]}")
+            print(f"\n  Options:")
+            print(f"    - Type your fix hint, then run: \033[1m/plan hint <your suggestion>\033[0m")
+            print(f"    - Or reset and retry: \033[1m/plan retry\033[0m")
+            return
+
+        # Check dependencies
+        deps = task.get("depends_on", [])
+        unmet = [d for d in deps if d-1 < len(tasks) and tasks[d-1]["status"] != "done"]
+        if unmet:
+            print(f"  \033[33m⚠ Task {task['id']} depends on incomplete tasks: {unmet}. Blocked.\033[0m")
+            return  # Don't skip — block
+
+        # Set mark before each task for rollback (persist to disk for cross-session)
+        do_mark(f"task-{task['id']}-start", persist=True)
+
+        # Build context prompt
+        done_tasks = [t for t in tasks if t["status"] == "done"]
+        done_summary = "\n".join(f"  ✓ {t['id']}. {t['title']}" for t in done_tasks)
+
+        task_prompt = f"""You are executing task {task['id']} of {total} in a project plan.
+
+CURRENT TASK: {task['title']}
+
+{'COMPLETED TASKS:' + chr(10) + done_summary if done_summary else 'This is the first task.'}
+
+PROJECT CONTEXT (from source document):
+{plan.get('document_summary', '')[:2000]}
+
+{'EXISTING PROJECT FILES (already read for you):' + project_context_files if project_context_files else ''}
+
+RULES (follow strictly):
+1. Write EXACTLY ONE file for this task. The file path is in the task title.
+2. Do NOT read files already shown above — they are pre-loaded for you.
+3. Do NOT use list_files or search_files unless the task requires finding something.
+4. Do NOT create multiple files or alternative versions.
+5. Call write_file (or edit_file) ONCE, then STOP.
+6. Do not explain what you will do — just do it immediately.
+7. Focus ONLY on this task. Do not implement other tasks."""
+
+        # If there's a hint from the user, append it
+        if hint:
+            task_prompt += f"\n\nUSER HINT for fixing this task:\n{hint}"
+            hint = None  # consume the hint
+
+        # If retrying after failure, include previous error
+        if task.get("last_error"):
+            task_prompt += f"\n\nPREVIOUS ATTEMPT FAILED WITH:\n{task['last_error']}\n\nFix this error."
+
+        print(f"\n  \033[1;36m[{task['id']}/{total}] {task['title']}\033[0m")
+        attempt = task.get("attempts", 0) + 1
+        if attempt > 1:
+            print(f"  \033[33m(attempt {attempt}/{MAX_RETRIES})\033[0m")
+        print(f"  {'─' * 50}")
+
+        # Execute with fresh message context
+        task_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task_prompt},
+        ]
+        agent_loop(task_messages)
+
+        # Verify the task succeeded (do this BEFORE checking interrupt,
+        # so completed work is never lost)
+        passed, error_msg = verify_task(task, task_messages)
+
+        if passed:
+            task["status"] = "done"
+            task["attempts"] = attempt
+            task.pop("last_error", None)
+            plan["current"] = idx + 1
+            with open(PLAN_FILE, "w") as f:
+                json.dump(plan, f, indent=2)
+            print(f"\n  \033[32m✓ Task {task['id']} complete (attempt {attempt})\033[0m")
+            idx += 1
+
+            if INTERRUPTED.is_set():
+                print(f"\n  \033[33mPlan paused. Resume with /plan run\033[0m")
+                return
+        elif INTERRUPTED.is_set():
+            plan["current"] = idx
+            with open(PLAN_FILE, "w") as f:
+                json.dump(plan, f, indent=2)
+            print(f"\n  \033[33mPlan paused. Resume with /plan run\033[0m")
+            return
+        else:
+            task["attempts"] = attempt
+            task["last_error"] = error_msg
+            print(f"\n  \033[31m✗ Task {task['id']} failed: {error_msg[:150]}\033[0m")
+
+            if attempt < MAX_RETRIES:
+                # Auto-retry (don't increment idx — retry same task)
+                print(f"  \033[33m⟳ Retrying ({attempt + 1}/{MAX_RETRIES})...\033[0m")
+                task["status"] = "pending"
+                plan["current"] = idx
+                with open(PLAN_FILE, "w") as f:
+                    json.dump(plan, f, indent=2)
+                continue  # retry same task — idx stays the same
+            else:
+                # Exhausted retries — block and wait for human
+                task["status"] = "failed"
+                plan["current"] = idx
+                with open(PLAN_FILE, "w") as f:
+                    json.dump(plan, f, indent=2)
+                print(f"\n  \033[31m✗ Task {task['id']} failed after {MAX_RETRIES} attempts.\033[0m")
+                print(f"    Error: {error_msg[:300]}")
+                print(f"\n  \033[1mWhat to do:\033[0m")
+                print(f"    /plan hint <suggestion>  — give a fix hint and retry")
+                print(f"    /plan retry              — retry from scratch")
+                print(f"    /plan rollback           — undo this task's changes")
+                return  # Stop — don't proceed to next task
+
+    # Check if all done
+    done = sum(1 for t in tasks if t["status"] == "done")
+    if done == total:
+        print(f"\n  \033[1;32m✓ All {total} tasks complete!\033[0m")
+        # Clean up snapshots — no rollback needed
+        if os.path.isfile(SNAPSHOTS_FILE):
+            os.remove(SNAPSHOTS_FILE)
+    else:
+        remaining = [t for t in tasks if t["status"] != "done"]
+        print(f"\n  \033[33m{done}/{total} tasks complete. Next: task {remaining[0]['id']}\033[0m")
+
+
+def plan_reset(task_id=None):
+    """Reset a task (or all tasks) back to pending."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found.")
+        return
+    if task_id:
+        for t in plan["tasks"]:
+            if t["id"] == task_id:
+                t["status"] = "pending"
+                print(f"  Reset task {task_id}: {t['title']}")
+                break
+        # Reset current pointer if needed
+        plan["current"] = min(plan["current"], task_id - 1)
+    else:
+        for t in plan["tasks"]:
+            t["status"] = "pending"
+        plan["current"] = 0
+        print(f"  Reset all {len(plan['tasks'])} tasks to pending.")
+    with open(PLAN_FILE, "w") as f:
+        json.dump(plan, f, indent=2)
+
+
+def plan_nuke(keep_code=False):
+    """Tear down everything: destroy infra, wipe plan, optionally wipe generated files."""
+    plan = plan_load()
+
+    # Step 1: Terraform destroy if .tf files exist
+    tf_dir = None
+    for root, dirs, files in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if d not in (".localcode", "node_modules", ".git")]
+        if any(f.endswith(".tf") for f in files):
+            tf_dir = root
+            break
+
+    if tf_dir and os.path.isdir(os.path.join(tf_dir, ".terraform")):
+        print(f"  \033[33mTerraform infrastructure detected in {os.path.relpath(tf_dir, WORKDIR)}/\033[0m")
+        if ask_permission("run", f"terraform destroy -auto-approve (in {os.path.relpath(tf_dir, WORKDIR)}/)"):
+            print(f"  \033[2mRunning terraform destroy...\033[0m")
+            result = subprocess.run(
+                "terraform destroy -auto-approve",
+                shell=True, capture_output=True, text=True,
+                timeout=300, cwd=tf_dir
+            )
+            if result.returncode == 0:
+                print(f"  \033[32m✓ Infrastructure destroyed\033[0m")
+            else:
+                print(f"  \033[31m✗ Destroy failed: {(result.stderr or result.stdout)[:300]}\033[0m")
+                print(f"  Continuing with file cleanup...")
+        else:
+            print(f"  Skipping terraform destroy.")
+    elif tf_dir:
+        print(f"  \033[2mNo terraform state found — nothing to destroy\033[0m")
+
+    # Step 2: Wipe generated code (unless keep_code)
+    if not keep_code:
+        if plan:
+            # Find files that were created during plan execution (from undo history)
+            generated = set()
+            for path, _ in UNDO_HISTORY:
+                if os.path.isfile(path) and ".localcode" not in path:
+                    generated.add(path)
+
+            if generated:
+                rel_files = [os.path.relpath(f, WORKDIR) for f in generated]
+                print(f"\n  Generated files ({len(generated)}):")
+                for f in sorted(rel_files)[:20]:
+                    print(f"    {f}")
+                if len(rel_files) > 20:
+                    print(f"    ... +{len(rel_files) - 20} more")
+
+                if ask_permission("run", f"delete {len(generated)} generated files"):
+                    for f in generated:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                    print(f"  \033[32m✓ Deleted {len(generated)} generated files\033[0m")
+                else:
+                    print(f"  Keeping generated files.")
+            else:
+                print(f"  No generated files tracked in this session.")
+        else:
+            print(f"  No plan — cannot determine which files were generated.")
+            print(f"  Manually delete files or use: rm -rf <paths>")
+
+    # Step 3: Wipe .localcode/ (plan, cache, state)
+    if os.path.isdir(PLAN_DIR):
+        if ask_permission("run", f"delete .localcode/ (plan state, cache)"):
+            import shutil as sh
+            sh.rmtree(PLAN_DIR)
+            print(f"  \033[32m✓ Wiped .localcode/\033[0m")
+        else:
+            print(f"  Keeping .localcode/")
+
+    # Step 4: Clear in-memory state
+    UNDO_HISTORY.clear()
+    MARKS.clear()
+    FILE_CACHE.clear()
+    print(f"\n  \033[32m✓ Clean slate. Run /plan <file> to start fresh.\033[0m")
+
+
+def handle_plan_command(args_str, messages):
+    """Handle /plan subcommands."""
+    parts = args_str.strip().split(None, 1)
+    subcmd = parts[0] if parts else ""
+
+    if subcmd in ("status", ""):
+        plan_status()
+    elif subcmd == "run":
+        plan_run(messages)
+    elif subcmd == "hint":
+        # /plan hint <suggestion> — apply user's fix hint to the failed task
+        if len(parts) < 2 or not parts[1].strip():
+            print("  Usage: /plan hint <your suggestion for fixing the failed task>")
+        else:
+            hint_text = parts[1].strip()
+            plan = plan_load()
+            if plan:
+                # Find the failed task
+                failed = [t for t in plan["tasks"] if t["status"] == "failed"]
+                if failed:
+                    task = failed[0]
+                    task["status"] = "pending"
+                    task["attempts"] = max(0, task.get("attempts", MAX_RETRIES) - 1)
+                    with open(PLAN_FILE, "w") as f:
+                        json.dump(plan, f, indent=2)
+                    print(f"  Applying hint to task {task['id']}: {task['title']}")
+                    plan_run(messages, hint=hint_text)
+                else:
+                    print("  No failed tasks. Use /plan run to continue.")
+            else:
+                print("  No plan found.")
+    elif subcmd == "retry":
+        # /plan retry — reset the failed task and try again from scratch
+        plan = plan_load()
+        if plan:
+            failed = [t for t in plan["tasks"] if t["status"] == "failed"]
+            if failed:
+                task = failed[0]
+                task["status"] = "pending"
+                task["attempts"] = 0
+                task.pop("last_error", None)
+                # Rollback changes from this task
+                mark_key = f"task-{task['id']}-start"
+                if mark_key in MARKS:
+                    do_rollback(mark_key)
+                with open(PLAN_FILE, "w") as f:
+                    json.dump(plan, f, indent=2)
+                print(f"  Reset task {task['id']} — retrying from scratch.")
+                plan_run(messages)
+            else:
+                print("  No failed tasks. Use /plan run to continue.")
+        else:
+            print("  No plan found.")
+    elif subcmd == "rollback":
+        # Rollback the current/failed task's changes
+        plan = plan_load()
+        if plan:
+            idx = plan["current"]
+            if idx < len(plan["tasks"]):
+                mark_key = f"task-{plan['tasks'][idx]['id']}-start"
+                if mark_key in MARKS:
+                    do_rollback(mark_key)
+                else:
+                    print(f"  No mark found for task {idx + 1}.")
+        else:
+            print("  No plan found.")
+    elif subcmd == "split":
+        plan_split()
+    elif subcmd == "nuke":
+        keep = len(parts) > 1 and "keep" in parts[1].lower()
+        plan_nuke(keep_code=keep)
+    elif subcmd == "done":
+        # /plan done N — manually mark task N as done
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            print("  Usage: /plan done <task_number>")
+        else:
+            tid = int(parts[1])
+            plan = plan_load()
+            if plan:
+                for t in plan["tasks"]:
+                    if t["id"] == tid:
+                        t["status"] = "done"
+                        print(f"  \033[32m✓ Marked task {tid} as done: {t['title']}\033[0m")
+                        break
+                else:
+                    print(f"  Task {tid} not found.")
+                with open(PLAN_FILE, "w") as f:
+                    json.dump(plan, f, indent=2)
+            else:
+                print("  No plan found.")
+    elif subcmd == "reset":
+        task_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        plan_reset(task_id)
+    elif subcmd == "resume":
+        plan_run(messages)
+    elif os.path.isfile(resolve_path(subcmd)) or subcmd.endswith(".pdf") or subcmd.endswith(".md"):
+        plan_create(subcmd)
+    else:
+        print("""  \033[1mPlan commands:\033[0m
+  /plan <file>        - Create plan from a document (PDF, MD, TXT)
+  /plan status        - Show plan progress
+  /plan split         - Break vague tasks into concrete file-level sub-tasks
+  /plan run           - Start/resume executing tasks
+  /plan hint <text>   - Give a fix suggestion for a failed task and retry
+  /plan retry         - Reset failed task and retry from scratch
+  /plan rollback      - Undo current task's file changes
+  /plan done N        - Manually mark task N as done
+  /plan reset [N]     - Reset task N (or all) to pending
+  /plan nuke          - Tear down infra + delete generated files + wipe plan
+  /plan nuke keep     - Tear down infra + wipe plan but keep generated code""")
+
+    return True
+
+
+# ─── End Plan System ─────────────────────────────────────────────────────────
+
+
+def show_diff(old_content, new_content, path):
+    """Show a Claude Code-style colored diff with line numbers and context."""
+    import difflib
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+
+    cols = shutil.get_terminal_size().columns
+    indent = "    "
+    bar_width = min(cols - 8, 60)
+
+    # Header
+    ext = os.path.splitext(path)[1].lstrip(".")
+    print(f"\n  \033[1;34m● {'Update' if old_content else 'Create'}({path})\033[0m")
+    print(f"  \033[2m{'─' * bar_width}\033[0m")
+
+    # Generate grouped diff with context
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    has_changes = False
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            # Show limited context (2 lines around changes)
+            lines = old_lines[i1:i2]
+            if len(lines) <= 4:
+                for k, line in enumerate(lines):
+                    ln = i1 + k + 1
+                    print(f"  \033[2m{ln:4d}│\033[0m {line}")
+            elif has_changes:
+                # Show first 2 of trailing context
+                for k in range(min(2, len(lines))):
+                    ln = i1 + k + 1
+                    print(f"  \033[2m{ln:4d}│\033[0m {lines[k]}")
+                if len(lines) > 4:
+                    print(f"  \033[2m    │ ⋮ {len(lines) - 4} unchanged lines\033[0m")
+                # Show last 2 as leading context for next change
+                for k in range(max(0, len(lines) - 2), len(lines)):
+                    ln = i1 + k + 1
+                    print(f"  \033[2m{ln:4d}│\033[0m {lines[k]}")
+            else:
+                # First block — just show last 2 lines as context
+                if len(lines) > 2:
+                    print(f"  \033[2m    │ ⋮ {len(lines) - 2} unchanged lines\033[0m")
+                for k in range(max(0, len(lines) - 2), len(lines)):
+                    ln = i1 + k + 1
+                    print(f"  \033[2m{ln:4d}│\033[0m {lines[k]}")
+        elif tag == "replace":
+            has_changes = True
+            for k, line in enumerate(old_lines[i1:i2]):
+                ln = i1 + k + 1
+                print(f"  \033[31m{ln:4d}│- {line}\033[0m")
+            for k, line in enumerate(new_lines[j1:j2]):
+                ln = j1 + k + 1
+                print(f"  \033[32m{ln:4d}│+ {line}\033[0m")
+        elif tag == "delete":
+            has_changes = True
+            for k, line in enumerate(old_lines[i1:i2]):
+                ln = i1 + k + 1
+                print(f"  \033[31m{ln:4d}│- {line}\033[0m")
+        elif tag == "insert":
+            has_changes = True
+            for k, line in enumerate(new_lines[j1:j2]):
+                ln = j1 + k + 1
+                print(f"  \033[32m{ln:4d}│+ {line}\033[0m")
+
+    print(f"  \033[2m{'─' * bar_width}\033[0m")
+    added = len(new_lines) - len(old_lines)
+    if added > 0:
+        print(f"  \033[32m+{sum(1 for t,_,_,_,_ in matcher.get_opcodes() if t in ('insert','replace'))} block(s)\033[0m, \033[2mnet +{added} lines\033[0m")
+    elif added < 0:
+        print(f"  \033[31m{added} lines\033[0m")
+    else:
+        print(f"  \033[2m±0 lines (modified in place)\033[0m")
+
+
+AUTO_APPROVE = False
+
+
+def ask_permission(action, detail, preview=None):
+    """Ask user for permission before modifying files or running commands.
+    Enter defaults to yes (Y). Type 'n' to deny. Type 'a' to approve all."""
+    global AUTO_APPROVE
+    if AUTO_APPROVE:
+        print(f"\n  \033[32m✓ {action}: {detail}\033[0m")
+        return True
+    print(f"\n  \033[33m? {action}: {detail}\033[0m")
+    if preview:
+        print(preview)
+    try:
+        answer = input("    Allow? [Y/n/a] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer == "a":
+        AUTO_APPROVE = True
+        return True
+    return answer != "n"
+
+
+# File read cache: path → {"mtime": float, "summary": str, "full": str}
+FILE_CACHE = {}
+
+
+def summarize_file(content, path):
+    """Create a compact summary of file contents for cache."""
+    lines = content.split("\n")
+    ext = os.path.splitext(path)[1].lower()
+
+    # For code files: keep imports, function/class/resource definitions, skip bodies
+    if ext in (".py", ".js", ".ts", ".tsx"):
+        key_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if (stripped.startswith(("import ", "from ", "def ", "class ", "export ", "function ", "const ", "module."))
+                    or stripped.startswith(("#", "//")) and len(stripped) < 80):
+                key_lines.append(line)
+        if key_lines:
+            return f"File: {path} ({len(lines)} lines)\nStructure:\n" + "\n".join(key_lines[:30])
+    elif ext == ".tf":
+        key_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(("resource ", "data ", "variable ", "output ", "module ", "provider ", "locals ")):
+                key_lines.append(line)
+        if key_lines:
+            return f"File: {path} ({len(lines)} lines)\nResources:\n" + "\n".join(key_lines)
+    elif ext in (".json", ".yaml", ".yml"):
+        # Keep first 10 lines (usually has structure)
+        return f"File: {path} ({len(lines)} lines)\n" + "\n".join(lines[:10])
+
+    # Default: first 5 + last 3 lines
+    if len(lines) > 15:
+        return f"File: {path} ({len(lines)} lines)\n" + "\n".join(lines[:5]) + f"\n...[{len(lines)-8} lines]...\n" + "\n".join(lines[-3:])
+    return content
+
+
 def execute_tool(name, args):
     if name == "read_file":
         path = resolve_path(args["path"])
         try:
+            if path.lower().endswith(".pdf"):
+                return read_pdf(path)
+
+            mtime = os.path.getmtime(path)
+
+            # Check cache: if file unchanged since last read, return summary
+            if path in FILE_CACHE and FILE_CACHE[path]["mtime"] == mtime:
+                return f"[cached — file unchanged since last read]\n{FILE_CACHE[path]['summary']}"
+
             with open(path) as f:
                 content = f.read()
             lines = content.split("\n")
             if len(lines) > 500:
-                return f"[{len(lines)} lines total, showing first 500]\n" + "\n".join(lines[:500])
-            return content
+                content = f"[{len(lines)} lines total, showing first 500]\n" + "\n".join(lines[:500])
+
+            # Cache it
+            FILE_CACHE[path] = {
+                "mtime": mtime,
+                "summary": summarize_file(content, args["path"]),
+                "full": content,
+            }
+            return f"File: {args['path']}\n{content}"
         except FileNotFoundError:
             return f"Error: File not found: {args['path']}"
         except PermissionError:
             return f"Error: Permission denied: {args['path']}"
+        except UnicodeDecodeError:
+            return f"Error: Binary file, cannot read as text: {args['path']}"
 
     elif name == "write_file":
         path = resolve_path(args["path"])
+        new_content = args["content"]
+        try:
+            with open(path) as f:
+                old_content = f.read()
+            show_diff(old_content, new_content, args["path"])
+        except FileNotFoundError:
+            old_content = ""
+            lines = new_content.split("\n")
+            preview_lines = lines[:25]
+            bar_width = min(shutil.get_terminal_size().columns - 8, 60)
+            print(f"\n  \033[1;32m● Create({args['path']})\033[0m")
+            print(f"  \033[2m{'─' * bar_width}\033[0m")
+            for i, line in enumerate(preview_lines, 1):
+                print(f"  \033[32m{i:4d}│+ {line}\033[0m")
+            if len(lines) > 25:
+                print(f"  \033[2m    │ ... +{len(lines) - 25} more lines\033[0m")
+            print(f"  \033[2m{'─' * bar_width}\033[0m")
+            print(f"  \033[32m{len(lines)} lines\033[0m")
+        if not ask_permission("write", args["path"]):
+            return "Denied: user rejected file write."
+        save_undo(path)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f:
-            f.write(args["content"])
+            f.write(new_content)
+        FILE_CACHE.pop(path, None)
         return f"Written: {args['path']}"
 
     elif name == "edit_file":
@@ -215,13 +1667,20 @@ def execute_tool(name, args):
         count = content.count(old)
         if count > 1:
             return f"Warning: old_string appears {count} times. Replacing first occurrence only."
-        content = content.replace(old, new, 1)
+        new_content = content.replace(old, new, 1)
+        show_diff(content, new_content, args["path"])
+        if not ask_permission("edit", args["path"]):
+            return "Denied: user rejected file edit."
+        save_undo(path)
         with open(path, "w") as f:
-            f.write(content)
+            f.write(new_content)
+        FILE_CACHE.pop(path, None)
         return f"Edited: {args['path']}"
 
     elif name == "run_command":
         cmd = args["command"]
+        if not ask_permission("run", cmd):
+            return "Denied: user rejected command execution."
         dangerous = ["rm -rf /", "rm -rf ~", "> /dev/sda", "mkfs", "dd if="]
         if any(d in cmd for d in dangerous):
             return "Error: Refusing to run potentially destructive command."
@@ -237,7 +1696,20 @@ def execute_tool(name, args):
                 output += ("\n" if output else "") + result.stderr
             if result.returncode != 0:
                 output += f"\n[exit code: {result.returncode}]"
-            return output[:5000] if output else "[no output]"
+            output = output[:5000] if output else "[no output]"
+            # Show command output to user
+            out_lines = output.strip().split("\n")
+            preview = out_lines[:10]
+            print(f"  \033[2m  ┌─ output ─────────────────\033[0m")
+            for line in preview:
+                print(f"  \033[2m  │\033[0m {line}")
+            if len(out_lines) > 10:
+                print(f"  \033[2m  │ ... {len(out_lines) - 10} more lines\033[0m")
+            if result.returncode == 0:
+                print(f"  \033[2m  └─ \033[32m✓ exit 0\033[0m")
+            else:
+                print(f"  \033[2m  └─ \033[31m✗ exit {result.returncode}\033[0m")
+            return output
         except subprocess.TimeoutExpired:
             return "Error: Command timed out (30s limit)"
 
@@ -498,12 +1970,18 @@ def parse_tool_calls_from_text(text):
     return calls
 
 
-def call_ollama(messages):
+def call_ollama(messages, model_override=None):
+    """Call Ollama API with spinner, ESC-to-interrupt, and token tracking."""
+    num_threads = max(4, (os.cpu_count() or 8) - 2)
     payload = json.dumps({
-        "model": MODEL,
+        "model": model_override or MODEL,
         "messages": messages,
         "tools": TOOLS,
         "stream": False,
+        "options": {
+            "num_thread": num_threads,
+            "num_ctx": 32768,
+        },
     }).encode()
 
     req = urllib.request.Request(
@@ -512,38 +1990,175 @@ def call_ollama(messages):
         headers={"Content-Type": "application/json"},
     )
 
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        return json.loads(resp.read())
+    # Track input tokens (all messages sent)
+    input_text = "".join(m.get("content", "") for m in messages)
+    input_tokens = estimate_tokens(input_text)
+    STATS["input_tokens"] += input_tokens
+
+    INTERRUPTED.clear()
+    result = [None]
+    error = [None]
+    t_start = time.time()
+
+    def do_request():
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                result[0] = json.loads(resp.read())
+        except Exception as e:
+            error[0] = e
+
+    # Run request in background, watch for ESC in foreground
+    thread = threading.Thread(target=do_request, daemon=True)
+    watcher = threading.Thread(target=watch_for_input, daemon=True)
+
+    thread.start()
+    watcher.start()
+
+    # Spinner with elapsed time while waiting
+    spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    spin_idx = 0
+
+    while thread.is_alive():
+        if INTERRUPTED.is_set():
+            sys.stdout.write("\r\033[K")  # clear spinner line
+            sys.stdout.flush()
+            print("  \033[33m[interrupted — press ESC or Ctrl+C]\033[0m")
+            raise InterruptedError()
+        elapsed = time.time() - t_start
+        spinner = spinner_chars[spin_idx % len(spinner_chars)]
+        sys.stdout.write(f"\r  \033[36m{spinner}\033[0m \033[2mthinking... {elapsed:.0f}s (ESC to stop)\033[0m")
+        sys.stdout.flush()
+        spin_idx += 1
+        thread.join(timeout=0.15)
+
+    # Clear spinner line
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+    # Stop the watcher thread, then clear the flag so it doesn't
+    # falsely trigger "plan paused" in plan_run
+    was_interrupted = INTERRUPTED.is_set()
+    INTERRUPTED.set()  # stop the watcher
+    watcher.join(timeout=0.5)
+    if not was_interrupted:
+        INTERRUPTED.clear()
+
+    duration = time.time() - t_start
+    STATS["last_request_duration"] = duration
+    STATS["requests"] += 1
+
+    if error[0]:
+        raise error[0]
+
+    # Track output tokens from response
+    resp_msg = result[0].get("message", {})
+    output_text = resp_msg.get("content", "")
+    if resp_msg.get("tool_calls"):
+        output_text += json.dumps(resp_msg["tool_calls"])
+    output_tokens = estimate_tokens(output_text)
+    STATS["output_tokens"] += output_tokens
+
+    # Print per-request timing
+    print(f"  \033[2m⏱ {duration:.1f}s │ ↑{format_tokens(input_tokens)} ↓{format_tokens(output_tokens)}\033[0m")
+
+    return result[0]
 
 
 def format_action(fn_name, fn_args):
+    """Format tool action for display — Claude Code style."""
     if fn_name == "read_file":
-        return f"read {fn_args.get('path', '')}"
+        return f"\033[36m📖 Read\033[0m({fn_args.get('path', '')})"
     elif fn_name == "write_file":
-        return f"write {fn_args.get('path', '')}"
+        return f"\033[32m✏️  Write\033[0m({fn_args.get('path', '')})"
     elif fn_name == "edit_file":
-        return f"edit {fn_args.get('path', '')}"
+        return f"\033[33m✏️  Edit\033[0m({fn_args.get('path', '')})"
     elif fn_name == "run_command":
-        return f"run: {fn_args.get('command', '')}"
+        cmd = fn_args.get('command', '')
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        return f"\033[35m⚡ Run\033[0m({cmd})"
     elif fn_name == "list_files":
-        return f"ls {fn_args.get('path', '.')}"
+        return f"\033[36m📂 List\033[0m({fn_args.get('path', '.')})"
     elif fn_name == "search_files":
-        return f"grep '{fn_args.get('pattern', '')}'"
+        return f"\033[36m🔍 Search\033[0m('{fn_args.get('pattern', '')}')"
     return fn_name
 
 
+def compact_messages(messages, keep_recent=6):
+    """Compact older tool results to reduce context size. Keeps recent messages full.
+    Deduplicates repeated file reads and summarizes verbose outputs."""
+    if len(messages) <= keep_recent + 2:
+        return
+
+    cutoff = len(messages) - keep_recent
+    seen_files = {}  # path → most recent index
+
+    # First pass: find which files were read multiple times
+    for i in range(cutoff):
+        msg = messages[i]
+        if msg.get("role") == "tool" and msg.get("content", "").startswith("File: "):
+            path = msg["content"].split("\n", 1)[0]
+            seen_files[path] = i  # keep track of latest read
+
+    # Second pass: compact
+    for i in range(cutoff):
+        msg = messages[i]
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if len(content) <= 200:
+            continue
+
+        # Deduplicate: if same file was read again later, collapse this one
+        if content.startswith("File: "):
+            path = content.split("\n", 1)[0]
+            if seen_files.get(path, i) > i:
+                messages[i] = {"role": "tool", "content": f"[already read {path} — see later result]"}
+                continue
+
+        # Compact long tool results: keep structure hints
+        lines = content.split("\n")
+        if len(lines) > 10:
+            messages[i] = {
+                "role": "tool",
+                "content": "\n".join(lines[:5]) + f"\n...[{len(lines) - 8} lines omitted]...\n" + "\n".join(lines[-3:])
+            }
+        elif len(content) > 500:
+            messages[i] = {
+                "role": "tool",
+                "content": f"{content[:200]}...[{len(content)} chars total]...{content[-100:]}"
+            }
+
+
 def agent_loop(messages):
-    max_iterations = 10
+    max_iterations = 30
     recent_actions = []
+    loop_start = time.time()
+    AGENT_RUNNING.set()
 
     for i in range(max_iterations):
+        # Compact older tool results to keep context lean
+        if i >= 3:
+            compact_messages(messages, keep_recent=6)
+
         try:
             response = call_ollama(messages)
+        except InterruptedError:
+            AGENT_RUNNING.clear()
+            print_stats_line(time.time() - loop_start)
+            print("  Stopped. Type your next prompt or command.")
+            return
         except urllib.error.URLError as e:
+            AGENT_RUNNING.clear()
             print(f"\n  Error communicating with Ollama: {e}")
             return
         except Exception as e:
-            print(f"\n  Error: {e}")
+            AGENT_RUNNING.clear()
+            err_str = str(e)
+            if "timed out" in err_str:
+                print(f"\n  \033[2m⚠ Model timed out (checking if task completed...)\033[0m")
+            else:
+                print(f"\n  \033[33m⚠ {e}\033[0m")
             return
 
         msg = response.get("message", {})
@@ -581,10 +2196,11 @@ def agent_loop(messages):
                 if code_match:
                     code = code_match.group(2).rstrip()
                     print(f"\n{content}")
-                    # Write the file directly and stop
                     result = execute_tool("write_file", {"path": target_path, "content": code})
                     print(f"\n  \033[2m[write {target_path}]\033[0m")
                     messages.append(msg)
+                    AGENT_RUNNING.clear()
+                    print_stats_line(time.time() - loop_start)
                     return
 
         messages.append(msg)
@@ -593,6 +2209,8 @@ def agent_loop(messages):
             print(f"\n{content}")
 
         if not tool_calls:
+            AGENT_RUNNING.clear()
+            print_stats_line(time.time() - loop_start)
             return
 
         for tc in tool_calls:
@@ -612,9 +2230,11 @@ def agent_loop(messages):
                         print(f"\n{final_content}")
                 except Exception:
                     pass
+                AGENT_RUNNING.clear()
+                print_stats_line(time.time() - loop_start)
                 return
 
-            print(f"\n  \033[2m[{format_action(fn_name, fn_args)}]\033[0m")
+            print(f"\n  {format_action(fn_name, fn_args)}")
 
             result = execute_tool(fn_name, fn_args)
 
@@ -623,10 +2243,13 @@ def agent_loop(messages):
                 "content": result,
             })
 
+    AGENT_RUNNING.clear()
     print("\n  [max iterations reached]")
+    print_stats_line(time.time() - loop_start)
 
 
 def handle_command(user_input, messages):
+    global MODEL
     parts = user_input.strip().split(None, 1)
     cmd = parts[0].lower()
 
@@ -640,18 +2263,70 @@ def handle_command(user_input, messages):
         return True
     elif cmd == "/model":
         if len(parts) > 1:
-            global MODEL
             MODEL = parts[1]
             print(f"Switched to: {MODEL}")
         else:
             print(f"Model: {MODEL}")
         return True
+    elif cmd == "/fast":
+        if MODEL == FAST_MODEL:
+            MODEL = detect_best_model()
+            print(f"Switched to full model: {MODEL}")
+        else:
+            MODEL = FAST_MODEL
+            print(f"Switched to fast model: {MODEL}")
+        return True
+    elif cmd == "/cost":
+        total_tokens = STATS["input_tokens"] + STATS["output_tokens"]
+        input_cost = STATS["input_tokens"] * CLAUDE_INPUT_COST_PER_M / 1_000_000
+        output_cost = STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M / 1_000_000
+        total_cost = input_cost + output_cost
+        session_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
+        print(f"""
+  \033[1mSession stats\033[0m
+  ─────────────────────────────────────
+  Tokens in:   {format_tokens(STATS['input_tokens']):>8}  (≈${input_cost:.2f} if Claude Sonnet)
+  Tokens out:  {format_tokens(STATS['output_tokens']):>8}  (≈${output_cost:.2f} if Claude Sonnet)
+  Total:       {format_tokens(total_tokens):>8}
+  Requests:    {STATS['requests']:>8}
+  ─────────────────────────────────────
+  \033[32mYou saved:   ${total_cost:.2f}\033[0m
+  Time:        {format_duration(session_time)}
+  Model:       {MODEL}
+  ─────────────────────────────────────""")
+        return True
+    elif cmd == "/undo":
+        count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        do_undo(count)
+        return True
+    elif cmd == "/mark":
+        name = parts[1] if len(parts) > 1 else "default"
+        do_mark(name)
+        return True
+    elif cmd == "/rollback":
+        if len(parts) < 2:
+            available = ", ".join(MARKS.keys()) if MARKS else "none"
+            print(f"  Usage: /rollback <name>. Available marks: {available}")
+        else:
+            do_rollback(parts[1])
+        return True
+    elif cmd == "/plan":
+        arg = parts[1] if len(parts) > 1 else ""
+        return handle_plan_command(arg, messages)
     elif cmd == "/help":
         print("""Commands:
-  /clear        - Clear conversation history
-  /model [name] - Show or switch the model
-  /help         - Show this help
-  /quit         - Exit
+  /clear            - Clear conversation history
+  /model [name]     - Show or switch the model
+  /fast             - Toggle between full and fast model
+  /cost             - Show token usage and money saved
+  /undo [N]         - Undo last N file changes (default: 1)
+  /mark <name>      - Set a named checkpoint
+  /rollback <name>  - Undo all changes back to a mark
+  /plan <file>      - Create execution plan from document
+  /plan run         - Execute plan tasks sequentially
+  /plan status      - Show plan progress
+  /help             - Show this help
+  /quit             - Exit
 
 Just type what you want. The agent will read, write, and edit files directly.""")
         return True
@@ -659,12 +2334,27 @@ Just type what you want. The agent will read, write, and edit files directly."""
 
 
 def main():
-    signal.signal(signal.SIGINT, lambda *_: print("\n"))
+    signal.signal(signal.SIGINT, lambda *_: INTERRUPTED.set())
+
+    # Set up readline history (up/down arrow to cycle commands)
+    histfile = os.path.join(PLAN_DIR, ".history")
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    try:
+        readline.read_history_file(histfile)
+    except FileNotFoundError:
+        pass
+    readline.set_history_length(500)
+    import atexit
+    atexit.register(readline.write_history_file, histfile)
 
     cols = shutil.get_terminal_size().columns
     print(f"\033[1mlocalcode\033[0m ({MODEL})")
     print(f"Working in: {WORKDIR}")
+    print(f"Press ESC to interrupt. Type /help for commands.")
     print("-" * min(cols, 50))
+
+    # Restore undo history from disk (for cross-session plan rollback)
+    load_snapshots()
 
     models = check_ollama()
     if models is None:
@@ -676,11 +2366,37 @@ def main():
         subprocess.run(["ollama", "pull", MODEL], check=True)
         print()
 
+    # Warm up model in background (loads weights into RAM)
+    warmup_done = threading.Event()
+    def warmup():
+        try:
+            payload = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False, "options": {"num_predict": 1}}).encode()
+            req = urllib.request.Request(f"{OLLAMA_HOST}/api/chat", data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                resp.read()
+        except Exception:
+            pass
+        warmup_done.set()
+
+    print(f"\033[2mLoading {MODEL} into RAM...\033[0m", end="", flush=True)
+    warmup_thread = threading.Thread(target=warmup, daemon=True)
+    warmup_thread.start()
+
+    # Wait for warmup but allow user to start typing immediately
+    warmup_thread.join(timeout=0.5)
+    if warmup_done.is_set():
+        print(f" \033[32m✓\033[0m")
+    else:
+        print(f" \033[2m(continuing in background)\033[0m")
+
     print("Ready. Ask me to generate, edit, or explain code.\n")
 
+    STATS["start_time"] = time.time()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
+        INTERRUPTED.clear()
+
         try:
             user_input = input("\033[1m> \033[0m")
         except (EOFError, KeyboardInterrupt):
