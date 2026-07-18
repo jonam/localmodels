@@ -193,6 +193,20 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_file",
+            "description": "Delete a file. Use for tasks that require removing a file from the project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to the working directory"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "Run a shell command and return its output. Use for: listing files, running tests, installing packages, git operations, building projects.",
             "parameters": {
@@ -594,7 +608,7 @@ def plan_create(source_path):
 CRITICAL CONSTRAINTS on the executing model:
 - It is SLOW (60-120s per response) and has limited context
 - It must complete each task in under 5 minutes wall-clock
-- It has tools: read_file, write_file, edit_file, run_command, list_files, search_files
+- It has tools: read_file, write_file, edit_file, delete_file, run_command, list_files, search_files
 - It runs ONE task at a time with no memory between tasks
 - Project files are pre-loaded into its context, so it should NOT need to read them again
 
@@ -885,6 +899,16 @@ def verify_task(task, task_messages):
     Uses _baseline_errors (set by plan_run before the task) to distinguish
     pre-existing project-wide errors from new ones this task introduced.
     """
+    # For DELETE tasks, verify the target file no longer exists
+    title = task.get("title", "")
+    if title.startswith("DELETE "):
+        # Extract file path from title: "DELETE path/to/file — reason"
+        target = title.split("DELETE ", 1)[1].split(" — ")[0].split(" —")[0].strip()
+        target_path = os.path.join(WORKDIR, target)
+        if not os.path.exists(target_path):
+            return True, ""
+        return False, f"File still exists: {target}"
+
     # Check if any files were written (via undo history since task mark)
     mark_key = f"task-{task['id']}-start"
     mark_pos = MARKS.get(mark_key, len(UNDO_HISTORY))
@@ -1117,7 +1141,7 @@ def plan_split():
 CRITICAL CONSTRAINTS on the executing model:
 - It is SLOW (60-120s per response) and has limited context
 - It must complete each task in under 5 minutes wall-clock
-- It has tools: read_file, write_file, edit_file, run_command, list_files, search_files
+- It has tools: read_file, write_file, edit_file, delete_file, run_command, list_files, search_files
 - It runs ONE task at a time with no memory between tasks
 - Project files are pre-loaded into its context, so it should NOT need to read them again
 
@@ -1318,7 +1342,8 @@ RULES (follow strictly):
 4. Do NOT create multiple files or alternative versions.
 5. Call write_file (or edit_file) ONCE, then STOP.
 6. Do not explain what you will do — just do it immediately.
-7. Focus ONLY on this task. Do not implement other tasks."""
+7. Focus ONLY on this task. Do not implement other tasks.
+8. Do NOT run tests, linters, validators, or install packages. Just write the code."""
 
         # If there's a hint from the user, append it
         if hint:
@@ -2081,6 +2106,17 @@ def execute_tool(name, args):
         FILE_CACHE.pop(path, None)
         return f"Edited: {args['path']}"
 
+    elif name == "delete_file":
+        path = resolve_path(args["path"])
+        if not os.path.isfile(path):
+            return f"Error: File not found: {args['path']}"
+        if not ask_permission("delete", args["path"]):
+            return "Denied: user rejected file deletion."
+        save_undo(path)
+        os.remove(path)
+        FILE_CACHE.pop(path, None)
+        return f"Deleted: {args['path']}"
+
     elif name == "run_command":
         cmd = args["command"]
         if not ask_permission("run", cmd):
@@ -2279,7 +2315,8 @@ def parse_tool_calls_from_text(text):
             # Map common aliases
             fn_map = {"create_file": "write_file", "create": "write_file", "read": "read_file",
                       "write": "write_file", "edit": "edit_file", "run": "run_command",
-                      "search": "search_files", "list": "list_files"}
+                      "search": "search_files", "list": "list_files",
+                      "delete": "delete_file", "remove_file": "delete_file", "rm": "delete_file"}
             fn = fn_map.get(fn, fn)
             args = tc.get("parameters") or tc.get("arguments", {})
             # Normalize arg names
@@ -2476,6 +2513,8 @@ def format_action(fn_name, fn_args):
         return f"\033[32m✏️  Write\033[0m({fn_args.get('path', '')})"
     elif fn_name == "edit_file":
         return f"\033[33m✏️  Edit\033[0m({fn_args.get('path', '')})"
+    elif fn_name == "delete_file":
+        return f"\033[31m🗑  Delete\033[0m({fn_args.get('path', '')})"
     elif fn_name == "run_command":
         cmd = fn_args.get('command', '')
         if len(cmd) > 60:
