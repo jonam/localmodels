@@ -69,6 +69,23 @@ def format_duration(seconds):
     return f"{minutes}m{secs:.0f}s"
 
 
+def snapshot_stats():
+    """Return a copy of current STATS for comparison."""
+    return dict(STATS)
+
+
+def stats_delta(before, after):
+    """Compute the difference between two stats snapshots."""
+    return {
+        "input_tokens": after["input_tokens"] - before["input_tokens"],
+        "output_tokens": after["output_tokens"] - before["output_tokens"],
+        "requests": after["requests"] - before["requests"],
+        "sonnet_input_tokens": after["sonnet_input_tokens"] - before["sonnet_input_tokens"],
+        "sonnet_output_tokens": after["sonnet_output_tokens"] - before["sonnet_output_tokens"],
+        "sonnet_requests": after["sonnet_requests"] - before["sonnet_requests"],
+    }
+
+
 def format_tokens(n, label=True):
     """Format token count. label=True appends ' tokens' for clarity in live displays."""
     suffix = " tokens" if label else ""
@@ -1349,13 +1366,57 @@ Rules:
             print(f"  \033[2mRaw output (first 500 chars): {content[:500]}\033[0m")
 
 
-def plan_run(messages, hint=None):
+def plan_run(messages, hint=None, model_override=None):
     """Execute plan tasks sequentially with verify-retry loop."""
+    global MODEL
     plan = plan_load()
     if not plan:
         print("  No plan found. Use /plan <file> to create one.")
         return
 
+    # A/B model override: swap MODEL for this run
+    original_model = MODEL
+    if model_override:
+        MODEL = model_override
+        print(f"  \033[1;35m⚗ A/B run with model: {model_override}\033[0m")
+
+    # Snapshot stats at start for per-run tracking
+    run_start_time = time.time()
+    run_stats_before = snapshot_stats()
+
+    try:
+        _plan_run_inner(plan, messages, hint, model_override, original_model)
+    finally:
+        # Always record run stats and restore model
+        run_elapsed = time.time() - run_start_time
+        run_stats_after = snapshot_stats()
+        delta = stats_delta(run_stats_before, run_stats_after)
+        run_model = model_override or original_model
+        plan = plan_load()
+        if plan and (delta["input_tokens"] > 0 or delta["requests"] > 0):
+            if "runs" not in plan:
+                plan["runs"] = {}
+            existing = plan["runs"].get(run_model, {})
+            plan["runs"][run_model] = {
+                "model": run_model,
+                "tasks_completed": sum(1 for t in plan["tasks"] if t["status"] == "done"),
+                "tasks_total": len(plan["tasks"]),
+                "reconcile_passes": plan.get("reconcile_passes", 0),
+                "qwen_input_tokens": existing.get("qwen_input_tokens", 0) + delta["input_tokens"],
+                "qwen_output_tokens": existing.get("qwen_output_tokens", 0) + delta["output_tokens"],
+                "qwen_requests": existing.get("qwen_requests", 0) + delta["requests"],
+                "sonnet_input_tokens": existing.get("sonnet_input_tokens", 0) + delta["sonnet_input_tokens"],
+                "sonnet_output_tokens": existing.get("sonnet_output_tokens", 0) + delta["sonnet_output_tokens"],
+                "sonnet_requests": existing.get("sonnet_requests", 0) + delta["sonnet_requests"],
+                "elapsed_seconds": existing.get("elapsed_seconds", 0) + run_elapsed,
+            }
+            with open(PLAN_FILE, "w") as f:
+                json.dump(plan, f, indent=2)
+        MODEL = original_model
+
+
+def _plan_run_inner(plan, messages, hint, model_override, original_model):
+    """Inner execution loop for plan_run (separated for try/finally stats tracking)."""
     tasks = plan["tasks"]
     total = len(tasks)
     start_from = plan.get("current", 0)
@@ -1557,7 +1618,7 @@ RULES (follow strictly):
             updated_plan = plan_load()
             if updated_plan and any(t["status"] == "pending" for t in updated_plan["tasks"]):
                 print(f"\n  \033[1;36m▶ Executing reconciliation fix tasks...\033[0m")
-                plan_run(messages)
+                plan_run(messages, model_override=model_override)
         elif reconcile_count >= 5:
             print(f"  \033[33m⚠ Reached max reconciliation passes (5). Run /plan reconcile manually if needed.\033[0m")
         else:
@@ -1588,6 +1649,93 @@ def plan_reset(task_id=None):
         print(f"  Reset all {len(plan['tasks'])} tasks to pending.")
     with open(PLAN_FILE, "w") as f:
         json.dump(plan, f, indent=2)
+
+
+def plan_compare():
+    """Show side-by-side comparison of A/B model runs."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found.")
+        return
+    runs = plan.get("runs", {})
+    if len(runs) < 2:
+        print(f"  Need at least 2 model runs to compare. Found: {len(runs)}")
+        if runs:
+            print(f"  Models run so far: {', '.join(runs.keys())}")
+        print(f"  Run with a different model: /plan run --model <model_name>")
+        return
+
+    # Header
+    models = list(runs.keys())
+    print(f"\n  \033[1m{'A/B Model Comparison':^60}\033[0m")
+    print(f"  {'═' * 60}")
+
+    # Column headers
+    col_w = 25
+    print(f"  {'Metric':<20}", end="")
+    for m in models:
+        short = m.split(":")[1] if ":" in m else m
+        print(f"  {short:>{col_w}}", end="")
+    print()
+    print(f"  {'─' * 20}", end="")
+    for _ in models:
+        print(f"  {'─' * col_w}", end="")
+    print()
+
+    # Rows
+    def row(label, key, fmt="d"):
+        print(f"  {label:<20}", end="")
+        for m in models:
+            val = runs[m].get(key, 0)
+            if fmt == "d":
+                print(f"  {val:>{col_w},}", end="")
+            elif fmt == "t":
+                print(f"  {format_tokens(val, label=False):>{col_w}}", end="")
+            elif fmt == "s":
+                print(f"  {format_duration(val):>{col_w}}", end="")
+            elif fmt == "$":
+                print(f"  {'${:.3f}'.format(val):>{col_w}}", end="")
+        print()
+
+    row("Tasks done", "tasks_completed")
+    row("Reconcile passes", "reconcile_passes")
+    row("Qwen tokens in", "qwen_input_tokens", "t")
+    row("Qwen tokens out", "qwen_output_tokens", "t")
+    row("Qwen requests", "qwen_requests")
+    row("Sonnet tokens in", "sonnet_input_tokens", "t")
+    row("Sonnet tokens out", "sonnet_output_tokens", "t")
+    row("Sonnet requests", "sonnet_requests")
+
+    # Computed cost row
+    print(f"  {'─' * 20}", end="")
+    for _ in models:
+        print(f"  {'─' * col_w}", end="")
+    print()
+    print(f"  {'Sonnet cost':<20}", end="")
+    for m in models:
+        r = runs[m]
+        cost = (r.get("sonnet_input_tokens", 0) * CLAUDE_INPUT_COST_PER_M +
+                r.get("sonnet_output_tokens", 0) * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+        print(f"  {'${:.3f}'.format(cost):>{col_w}}", end="")
+    print()
+    row("Elapsed time", "elapsed_seconds", "s")
+
+    # Winner summary
+    print(f"\n  {'─' * 60}")
+    costs = {}
+    for m in models:
+        r = runs[m]
+        costs[m] = (r.get("sonnet_input_tokens", 0) * CLAUDE_INPUT_COST_PER_M +
+                    r.get("sonnet_output_tokens", 0) * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+    cheapest = min(costs, key=costs.get)
+    fastest = min(models, key=lambda m: runs[m].get("elapsed_seconds", float("inf")))
+    fewest_reconcile = min(models, key=lambda m: runs[m].get("reconcile_passes", float("inf")))
+
+    short_name = lambda m: m.split(":")[1] if ":" in m else m
+    print(f"  \033[32m🏆 Cheapest:     {short_name(cheapest)} (${costs[cheapest]:.3f})\033[0m")
+    print(f"  \033[32m🏆 Fastest:      {short_name(fastest)} ({format_duration(runs[fastest]['elapsed_seconds'])})\033[0m")
+    print(f"  \033[32m🏆 Cleanest:     {short_name(fewest_reconcile)} ({runs[fewest_reconcile].get('reconcile_passes', 0)} reconcile passes)\033[0m")
+    print()
 
 
 def plan_nuke(keep_code=False):
@@ -1891,7 +2039,20 @@ def handle_plan_command(args_str, messages):
     if subcmd in ("status", ""):
         plan_status()
     elif subcmd == "run":
-        plan_run(messages)
+        # Parse --model flag: /plan run --model qwen3-coder:30b-a3b-q8_0
+        model_arg = None
+        if len(parts) > 1 and "--model" in parts[1]:
+            run_args = parts[1].split()
+            for i, a in enumerate(run_args):
+                if a == "--model" and i + 1 < len(run_args):
+                    model_arg = run_args[i + 1]
+                    break
+            if not model_arg:
+                print("  Usage: /plan run --model <model_name>")
+                return True
+        plan_run(messages, model_override=model_arg)
+    elif subcmd == "compare":
+        plan_compare()
     elif subcmd == "hint":
         # /plan hint <suggestion> — apply user's fix hint to the failed task
         if len(parts) < 2 or not parts[1].strip():
@@ -1988,6 +2149,8 @@ def handle_plan_command(args_str, messages):
   /plan status        - Show plan progress
   /plan split         - Break vague tasks into concrete file-level sub-tasks
   /plan run           - Start/resume executing tasks
+  /plan run --model X - Run with alternate model (A/B comparison)
+  /plan compare       - Show side-by-side A/B model comparison
   /plan reconcile     - Analyze all files for cross-module issues, emit fix tasks
   /plan hint <text>   - Give a fix suggestion for a failed task and retry
   /plan retry         - Reset failed task and retry from scratch
@@ -2978,6 +3141,8 @@ def handle_command(user_input, messages):
   /rollback <name>  - Undo all changes back to a mark
   /plan <file>      - Create execution plan from document
   /plan run         - Execute plan tasks sequentially
+  /plan run --model - A/B test with alternate model
+  /plan compare     - Compare model runs side-by-side
   /plan status      - Show plan progress
   /help             - Show this help
   /quit             - Exit
