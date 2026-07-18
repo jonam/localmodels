@@ -2039,17 +2039,29 @@ def handle_plan_command(args_str, messages):
     if subcmd in ("status", ""):
         plan_status()
     elif subcmd == "run":
-        # Parse --model flag: /plan run --model qwen3-coder:30b-a3b-q8_0
+        # Parse model override: /plan run q8, /plan run q4, /plan run --model <full_name>
         model_arg = None
-        if len(parts) > 1 and "--model" in parts[1]:
-            run_args = parts[1].split()
-            for i, a in enumerate(run_args):
-                if a == "--model" and i + 1 < len(run_args):
-                    model_arg = run_args[i + 1]
-                    break
-            if not model_arg:
-                print("  Usage: /plan run --model <model_name>")
-                return True
+        if len(parts) > 1:
+            arg = parts[1].strip()
+            # Shorthand aliases
+            MODEL_ALIASES = {
+                "q8": "qwen3-coder:30b-a3b-q8_0",
+                "q4": "qwen3-coder:30b",
+                "fast": FAST_MODEL,
+            }
+            if arg in MODEL_ALIASES:
+                model_arg = MODEL_ALIASES[arg]
+            elif arg.startswith("--model"):
+                run_args = arg.split()
+                for i, a in enumerate(run_args):
+                    if a == "--model" and i + 1 < len(run_args):
+                        model_arg = run_args[i + 1]
+                        break
+                if not model_arg:
+                    print("  Usage: /plan run q8  (or /plan run --model <full_name>)")
+                    return True
+            elif ":" in arg or "/" in arg:
+                model_arg = arg
         plan_run(messages, model_override=model_arg)
     elif subcmd == "compare":
         plan_compare()
@@ -2149,7 +2161,8 @@ def handle_plan_command(args_str, messages):
   /plan status        - Show plan progress
   /plan split         - Break vague tasks into concrete file-level sub-tasks
   /plan run           - Start/resume executing tasks
-  /plan run --model X - Run with alternate model (A/B comparison)
+  /plan run q8        - Run with Q8 model (A/B comparison)
+  /plan run q4        - Run with Q4 model explicitly
   /plan compare       - Show side-by-side A/B model comparison
   /plan reconcile     - Analyze all files for cross-module issues, emit fix tasks
   /plan hint <text>   - Give a fix suggestion for a failed task and retry
@@ -3143,7 +3156,7 @@ def handle_command(user_input, messages):
   /rollback <name>  - Undo all changes back to a mark
   /plan <file>      - Create execution plan from document
   /plan run         - Execute plan tasks sequentially
-  /plan run --model - A/B test with alternate model
+  /plan run q8      - A/B test with Q8 model
   /plan compare     - Compare model runs side-by-side
   /plan status      - Show plan progress
   /help             - Show this help
