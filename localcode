@@ -3362,14 +3362,33 @@ def main():
     # Restore undo history from disk (for cross-session plan rollback)
     load_snapshots()
 
+    # Check prerequisites with friendly messages
+    if not shutil.which("ollama"):
+        print(f"\n  \033[1;31mOllama is not installed.\033[0m")
+        print(f"  Ollama runs AI models locally on your machine.\n")
+        print(f"  Quick install:")
+        print(f"    curl -fsSL https://ollama.com/install.sh | sh\n")
+        print(f"  Or run the full setup:")
+        print(f"    ./setup.sh\n")
+        sys.exit(1)
+
     models = check_ollama()
     if models is None:
-        print("Error: Ollama is not running. Start it with: ollama serve")
+        print(f"\n  \033[1;33mOllama is installed but not running.\033[0m\n")
+        print(f"  Start it with:")
+        print(f"    ollama serve\n")
+        print(f"  Then re-run localcode.")
         sys.exit(1)
 
     if not check_model_available(models):
-        print(f"Pulling {MODEL}...")
-        subprocess.run(["ollama", "pull", MODEL], check=True)
+        print(f"\n  \033[1;33mModel '{MODEL}' not found locally.\033[0m")
+        print(f"  Available models: {', '.join(models[:5]) if models else 'none'}")
+        print(f"  Downloading {MODEL} (this may take a while on first run)...\n")
+        result = subprocess.run(["ollama", "pull", MODEL])
+        if result.returncode != 0:
+            print(f"\n  \033[31mFailed to pull {MODEL}.\033[0m")
+            print(f"  Check your internet connection and try: ollama pull {MODEL}")
+            sys.exit(1)
         print()
 
     # Warm up model in background (loads weights into RAM)
