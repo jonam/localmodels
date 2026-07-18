@@ -620,12 +620,12 @@ CRITICAL CONSTRAINTS on the executing model:
 - It has tools: read_file, write_file, edit_file, delete_file, run_command, list_files, search_files
 - It runs ONE task at a time with no memory between tasks
 - Project files are pre-loaded into its context, so it should NOT need to read them again
+- It CANNOT see the source document — only the task title and description you write
 
 Each sub-task MUST:
 - Touch EXACTLY 1 file (never 2+)
 - Be completable in 2-4 tool calls (ideally: 1 read + 1 write, or just 1 write)
 - Name the EXACT file path and EXACT action in the title
-- Specify what the file should contain or what change to make
 - Have a single clear deliverable
 
 Existing project files:
@@ -635,16 +635,27 @@ Project document:
 {text[:12000]}
 
 Output ONLY a JSON array. Format:
-[{{"id": 1, "title": "Create terraform/lambda/enroll.py — Lambda handler that calls VoiceID CreateSpeaker with audio from S3", "depends_on": []}}, ...]
+[{{"id": 1, "title": "CREATE terraform/lambda/enroll.py — Lambda handler for speaker enrollment", "description": "Create a Python Lambda handler...(see below for what to include)", "depends_on": []}}, ...]
+
+DESCRIPTION FIELD (critical for reducing errors):
+The description is the ONLY spec the executing model receives. It must contain ALL concrete details needed to implement the task correctly without any other context:
+- Exact variable names, function signatures, class names
+- Exact port numbers, URLs, endpoint paths
+- Exact environment variable names (e.g., EC2_URL not "the EC2 endpoint variable")
+- Exact resource names for Terraform (e.g., aws_security_group.lambda_sg)
+- Exact import paths and package names (e.g., "@aws-sdk/client-s3" not "AWS SDK")
+- Exact API contracts: request/response field names, HTTP methods, status codes
+- Cross-file references: if this file references another, name the exact export/resource
+- 3-8 lines is ideal. Be specific, not verbose.
 
 Rules:
-- Title format: "ACTION path/to/file.ext — WHAT_IT_DOES_SPECIFICALLY"
+- Title format: "ACTION path/to/file.ext — SHORT_SUMMARY"
+- Description: all implementation details the agent needs
 - ONE file per task, no exceptions
 - If a feature needs a Lambda + its Terraform resource + its IAM policy, that's 3 separate tasks
 - Prefer more smaller tasks over fewer larger ones (30-60 tasks is fine)
 - depends_on lists task IDs that must complete first
-- Keep IDs sequential starting from 1
-- Each title should be specific enough that a developer could implement it without reading the source document"""
+- Keep IDs sequential starting from 1"""
         response = call_claude_api(parse_prompt)
         if response:
             try:
@@ -742,7 +753,8 @@ def plan_status():
             icon = "\033[33m▶\033[0m"
         else:
             icon = "\033[2m○\033[0m"
-        print(f"  {icon} {t['id']:3d}. {t['title']}")
+        display_title = t['title'].split('\n')[0]
+        print(f"  {icon} {t['id']:3d}. {display_title}")
     print(f"  {'─' * bar_width}")
 
 
@@ -1225,12 +1237,12 @@ CRITICAL CONSTRAINTS on the executing model:
 - It has tools: read_file, write_file, edit_file, delete_file, run_command, list_files, search_files
 - It runs ONE task at a time with no memory between tasks
 - Project files are pre-loaded into its context, so it should NOT need to read them again
+- It CANNOT see the source document — only the task title and description you write
 
 Each sub-task MUST:
 - Touch EXACTLY 1 file (never 2+)
 - Be completable in 2-4 tool calls (ideally: 1 read + 1 write, or just 1 write)
 - Name the EXACT file path and EXACT action in the title
-- Specify what the file should contain or what change to make
 - Have a single clear deliverable
 
 Existing project files:
@@ -1243,10 +1255,22 @@ Tasks to split:
 {tasks_json}
 
 Output ONLY a JSON array. Format:
-[{{"id": 1, "title": "Create terraform/lambda/enroll.py — Lambda handler that calls VoiceID CreateSpeaker with audio from S3", "depends_on": []}}]
+[{{"id": 1, "title": "CREATE terraform/lambda/enroll.py — Lambda handler for enrollment", "description": "Create enroll.py with handler function...(all details needed)", "depends_on": []}}]
+
+DESCRIPTION FIELD (critical for reducing errors):
+The description is the ONLY spec the executing model receives. Include ALL concrete details:
+- Exact variable names, function signatures, class names
+- Exact port numbers, URLs, endpoint paths
+- Exact environment variable names (e.g., EC2_URL not "the EC2 endpoint variable")
+- Exact resource names for Terraform (e.g., aws_security_group.lambda_sg)
+- Exact import paths and package names (e.g., "@aws-sdk/client-s3" not "AWS SDK")
+- Exact API contracts: request/response field names, HTTP methods, status codes
+- Cross-file references: if this file references another, name the exact export/resource
+- 3-8 lines is ideal. Be specific, not verbose.
 
 Rules:
-- Title format: "ACTION path/to/file.ext — WHAT_IT_DOES_SPECIFICALLY"
+- Title format: "ACTION path/to/file.ext — SHORT_SUMMARY"
+- Description: all implementation details the agent needs
 - ONE file per task, no exceptions
 - If a feature needs a Lambda + its Terraform resource + its IAM policy, that's 3 separate tasks
 - Prefer more smaller tasks over fewer larger ones (30-60 tasks is fine)
@@ -1405,10 +1429,11 @@ def plan_run(messages, hint=None):
         done_tasks = [t for t in tasks if t["status"] == "done"]
         done_summary = "\n".join(f"  ✓ {t['id']}. {t['title']}" for t in done_tasks)
 
+        task_desc = task.get("description", "")
         task_prompt = f"""You are executing task {task['id']} of {total} in a project plan.
 
 CURRENT TASK: {task['title']}
-
+{chr(10) + 'SPECIFICATION:' + chr(10) + task_desc + chr(10) if task_desc else ''}
 {'COMPLETED TASKS:' + chr(10) + done_summary if done_summary else 'This is the first task.'}
 
 PROJECT CONTEXT (from source document):
@@ -1424,7 +1449,8 @@ RULES (follow strictly):
 5. Call write_file (or edit_file) ONCE, then STOP.
 6. Do not explain what you will do — just do it immediately.
 7. Focus ONLY on this task. Do not implement other tasks.
-8. Do NOT run tests, linters, validators, or install packages. Just write the code."""
+8. Do NOT run tests, linters, validators, or install packages. Just write the code.
+9. Follow the SPECIFICATION exactly — use the exact names, ports, and values specified."""
 
         # If there's a hint from the user, append it
         if hint:
@@ -1435,7 +1461,7 @@ RULES (follow strictly):
         if task.get("last_error"):
             task_prompt += f"\n\nPREVIOUS ATTEMPT FAILED WITH:\n{task['last_error']}\n\nFix this error."
 
-        print(f"\n  \033[1;36m[{task['id']}/{total}] {task['title']}\033[0m")
+        print(f"\n  \033[1;36m[{task['id']}/{total}] {task['title'].split(chr(10))[0]}\033[0m")
         attempt = task.get("attempts", 0) + 1
         if attempt > 1:
             print(f"  \033[33m(attempt {attempt}/{MAX_RETRIES})\033[0m")
@@ -1814,17 +1840,18 @@ Rules:
         old_text = fix.get("old_text", "")
         new_text = fix.get("new_text", "")
 
-        # Build a highly specific task title that QWEN can execute mechanically
+        # Build description with exact edit instructions for QWEN
         if old_text and new_text:
-            full_title = f"{title}\n    EXACT EDIT: Replace ```{old_text}``` with ```{new_text}```"
+            description = f"EXACT EDIT: Find this text:\n```\n{old_text}\n```\nReplace with:\n```\n{new_text}\n```"
         elif title.startswith("DELETE"):
-            full_title = title
+            description = f"Delete this file entirely. Reason: {details}" if details else ""
         else:
-            full_title = f"{title}\n    DETAILS: {details}"
+            description = details
 
         new_task = {
             "id": task_id,
-            "title": full_title,
+            "title": title,
+            "description": description,
             "depends_on": [],
             "status": "pending",
             "severity": fix.get("severity", "medium"),
