@@ -863,14 +863,75 @@ def _detect_platform():
     return "linux-apt"  # fallback
 
 
-def _prompt_install_dependency(binary, file_ext):
-    """Prompt user to install a missing binary. Returns True if installed, False if declined."""
+def _consult_sonnet_for_dependency(binary, file_ext, task_title=""):
+    """Ask Sonnet whether a binary is truly needed and how to install it.
+    Returns (install_cmd, is_needed, reason) or None if Sonnet unavailable."""
+    platform = _detect_platform()
+    prompt = f"""A local coding agent (Qwen) needs the binary "{binary}" to validate {file_ext} files.
+Platform: {platform}
+Task being executed: {task_title[:200] if task_title else "unknown"}
+
+Answer as JSON with these fields:
+- "needed": true/false — is this binary genuinely required for this task, or is the agent hallucinating?
+- "install_cmd": the exact shell command to install it on this platform (or null if not needed)
+- "reason": one sentence explaining your decision
+- "alternatives": if not needed, what should the agent do instead (or null)"""
+
+    response = call_claude_api(prompt, max_tokens=512)
+    if not response:
+        return None
+
+    try:
+        # Strip markdown fences if present
+        cleaned = re.sub(r'```(?:json)?\s*\n?', '', response).strip()
+        cleaned = re.sub(r'```', '', cleaned).strip()
+        result = json.loads(cleaned)
+        return result
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _prompt_install_dependency(binary, file_ext, task_title=""):
+    """Prompt user to install a missing binary. Returns True if installed, False if declined.
+
+    Tier 1: Check hardcoded hints for known binaries (free, instant).
+    Tier 2: Consult Sonnet for unknown binaries (determines if truly needed + install cmd).
+    """
     platform = _detect_platform()
     hints = _INSTALL_HINTS.get(binary, {})
-    install_cmd = hints.get(platform, f"# install '{binary}' using your package manager")
 
-    print(f"\n  \033[33m⚠ '{binary}' is required to validate {file_ext} files but is not installed.\033[0m")
-    print(f"    Suggested install command: \033[1m{install_cmd}\033[0m")
+    if hints:
+        # Tier 1: Known binary — use hardcoded install command
+        install_cmd = hints.get(platform, f"# install '{binary}' using your package manager")
+        print(f"\n  \033[33m⚠ '{binary}' is required to validate {file_ext} files but is not installed.\033[0m")
+        print(f"    Suggested install command: \033[1m{install_cmd}\033[0m")
+    else:
+        # Tier 2: Unknown binary — ask Sonnet for guidance
+        print(f"\n  \033[33m⚠ '{binary}' is not installed. Consulting Sonnet...\033[0m")
+        advice = _consult_sonnet_for_dependency(binary, file_ext, task_title)
+
+        if advice and not advice.get("needed", True):
+            # Sonnet says it's not actually needed
+            reason = advice.get("reason", "Not required for this task.")
+            alt = advice.get("alternatives", "")
+            print(f"  \033[32m✓ Sonnet says '{binary}' is NOT needed:\033[0m {reason}")
+            if alt:
+                print(f"    Alternative: {alt}")
+            return True  # Skip — don't block the task
+
+        if advice and advice.get("install_cmd"):
+            install_cmd = advice["install_cmd"]
+            reason = advice.get("reason", "")
+            print(f"  \033[33m⚠ '{binary}' is required to validate {file_ext} files.\033[0m")
+            if reason:
+                print(f"    Sonnet: {reason}")
+            print(f"    Suggested install command: \033[1m{install_cmd}\033[0m")
+        else:
+            install_cmd = f"# install '{binary}' using your package manager"
+            print(f"  \033[33m⚠ '{binary}' is required to validate {file_ext} files but is not installed.\033[0m")
+            print(f"    Could not determine install command automatically.")
+            print(f"    Install '{binary}' manually, then retry.")
+
     print()
 
     while True:
@@ -967,7 +1028,7 @@ def verify_task(task, task_messages):
         if check_cmd:
             # Check if the required binary is available before running
             if required_bin and not shutil.which(required_bin):
-                if not _prompt_install_dependency(required_bin, ext):
+                if not _prompt_install_dependency(required_bin, ext, task.get("title", "")):
                     raise DependencyAbort(required_bin)
             try:
                 result = subprocess.run(
