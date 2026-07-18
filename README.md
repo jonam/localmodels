@@ -2,6 +2,8 @@
 
 A terminal coding agent like Claude Code, but runs locally with Qwen3-Coder via Ollama. No API keys, no cost, works offline.
 
+*Single-file by design — no dependencies beyond Python 3 and Ollama. Clone and run.*
+
 The agent reads files, writes files, edits code, runs commands, and iterates - not just chat.
 
 ## Setup
@@ -49,10 +51,12 @@ The agent loop: prompt → model decides actions → executes tools → feeds re
 | Command | Description |
 | --- | --- |
 | `/clear` | Reset conversation |
+| `/cost` | Show token usage and money saved |
 | `/model [name]` | Show or switch model |
 | `/fast` | Toggle between full and fast model |
 | `/help` | Show commands |
 | `/quit` | Exit |
+| ESC | Pause mid-run (check cost/status, then resume or stop) |
 
 ## Plan System
 
@@ -71,6 +75,10 @@ Turn any project document (PDF, MD, TXT) into a fully executed codebase:
 | `/plan <file>` | Create execution plan from a document |
 | `/plan status` | Show progress |
 | `/plan run` | Start/resume task execution |
+| `/plan run q8` | Run with Q8 model (A/B comparison) |
+| `/plan run q4` | Run with Q4 model explicitly |
+| `/plan ab` | Save run to git branch, reset for next model |
+| `/plan compare` | Show side-by-side A/B model comparison |
 | `/plan reconcile` | Manually trigger cross-module analysis |
 | `/plan hint <text>` | Give a fix hint for a failed task |
 | `/plan retry` | Reset failed task and retry |
