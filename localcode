@@ -2361,6 +2361,11 @@ def extract_tool_call_fields(text):
             args["recursive"] = recursive_match.group(1) == "true"
         return {"function": {"name": name, "arguments": args}}
 
+    if name == "delete_file":
+        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', text)
+        if path_match:
+            return {"function": {"name": name, "arguments": {"path": path_match.group(1)}}}
+
     if name == "search_files":
         pattern_match = re.search(r'"pattern"\s*:\s*"([^"]*)"', text)
         if pattern_match:
@@ -2480,6 +2485,36 @@ def parse_tool_calls_from_text(text):
                     if extracted:
                         calls.append(extracted)
                 start = None
+
+    if calls:
+        return calls
+
+    # Parse XML-style function calls: <function=name>\n<parameter=key>value</parameter>\n</function>
+    xml_pattern = re.compile(
+        r'<function=(\w+)>\s*\n(.*?)</function>',
+        re.DOTALL
+    )
+    for m in xml_pattern.finditer(text):
+        fn_name = m.group(1)
+        body = m.group(2)
+        # Map aliases
+        fn_map = {"create_file": "write_file", "create": "write_file", "read": "read_file",
+                  "write": "write_file", "edit": "edit_file", "run": "run_command",
+                  "search": "search_files", "list": "list_files",
+                  "delete": "delete_file", "remove_file": "delete_file", "rm": "delete_file",
+                  "write_file": "write_file", "edit_file": "edit_file", "read_file": "read_file",
+                  "delete_file": "delete_file", "run_command": "run_command",
+                  "list_files": "list_files", "search_files": "search_files"}
+        fn_name = fn_map.get(fn_name, fn_name)
+        if fn_name not in TOOL_NAMES:
+            continue
+        # Extract parameters from <parameter=key>value</parameter> tags
+        args = {}
+        param_pattern = re.compile(r'<parameter=(\w+)>\s*\n?(.*?)\s*</parameter>', re.DOTALL)
+        for pm in param_pattern.finditer(body):
+            args[pm.group(1)] = pm.group(2).strip()
+        if args:
+            calls.append({"function": {"name": fn_name, "arguments": args}})
 
     if calls:
         return calls
