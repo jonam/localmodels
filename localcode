@@ -1609,20 +1609,28 @@ RULES (follow strictly):
         # Clean up snapshots — no rollback needed
         if os.path.isfile(SNAPSHOTS_FILE):
             os.remove(SNAPSHOTS_FILE)
-        # Auto-reconcile: check for cross-module issues until clean
+        # Auto-reconcile: check for cross-module issues until clean or not converging
         reconcile_count = plan.get("reconcile_passes", 0)
-        if not plan.get("reconciled") and reconcile_count < 5:
+        history = plan.get("reconcile_history", [])
+
+        if plan.get("reconciled"):
+            print(f"  \033[32m✓ Reconciliation complete — all cross-module issues resolved.\033[0m")
+        elif reconcile_count >= 5:
+            print(f"  \033[33m⚠ Reached max reconciliation passes (5). Run /plan reconcile manually if needed.\033[0m")
+        elif len(history) >= 2 and history[-1] >= history[-2]:
+            print(f"  \033[33m⚠ Reconciliation not converging (pass {len(history)-1}: {history[-2]} issues → pass {len(history)}: {history[-1]} issues).\033[0m")
+            print(f"  \033[33m  Issues are not decreasing — manual review needed.\033[0m")
+            print(f"  \033[2m  History: {' → '.join(str(h) for h in history)}\033[0m")
+        else:
             print(f"\n  \033[1;36m⟳ Running cross-module reconciliation pass {reconcile_count + 1} (Sonnet)...\033[0m")
+            if history:
+                print(f"  \033[2m  Issue history: {' → '.join(str(h) for h in history)}\033[0m")
             plan_reconcile()
             # If reconcile added new tasks, auto-continue
             updated_plan = plan_load()
             if updated_plan and any(t["status"] == "pending" for t in updated_plan["tasks"]):
                 print(f"\n  \033[1;36m▶ Executing reconciliation fix tasks...\033[0m")
                 plan_run(messages, model_override=model_override)
-        elif reconcile_count >= 5:
-            print(f"  \033[33m⚠ Reached max reconciliation passes (5). Run /plan reconcile manually if needed.\033[0m")
-        else:
-            print(f"  \033[32m✓ Reconciliation complete — all cross-module issues resolved.\033[0m")
     else:
         remaining = [t for t in tasks if t["status"] != "done"]
         print(f"\n  \033[33m{done}/{total} tasks complete. Next: task {remaining[0]['id']}\033[0m")
@@ -2158,6 +2166,9 @@ Rules:
         print("  \033[32m✓ No cross-module issues found! Code is consistent.\033[0m")
         plan["reconciled"] = True
         plan["reconcile_passes"] = plan.get("reconcile_passes", 0) + 1
+        if "reconcile_history" not in plan:
+            plan["reconcile_history"] = []
+        plan["reconcile_history"].append(0)
         with open(PLAN_FILE, "w") as f:
             json.dump(plan, f, indent=2)
         return
@@ -2204,6 +2215,10 @@ Rules:
     plan["reconciled"] = False  # not yet — fixes still pending
     plan["reconcile_passes"] = plan.get("reconcile_passes", 0) + 1
     plan["reconcile_task_start"] = max_id + 1
+    # Track issue counts per pass for convergence detection
+    if "reconcile_history" not in plan:
+        plan["reconcile_history"] = []
+    plan["reconcile_history"].append(len(fix_tasks))
     with open(PLAN_FILE, "w") as f:
         json.dump(plan, f, indent=2)
 
