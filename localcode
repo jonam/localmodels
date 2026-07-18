@@ -2808,8 +2808,9 @@ def call_ollama(messages, model_override=None):
                 # Update live display with rising token counter
                 elapsed = time.time() - t_start
                 spinner = spinner_chars[spin_idx % len(spinner_chars)]
+                m_short = MODEL.split(":")[1] if ":" in MODEL else MODEL
                 sys.stdout.write(
-                    f"\r  \033[36m{spinner}\033[0m \033[2mqwen │ {elapsed:.0f}s │ "
+                    f"\r  \033[36m{spinner}\033[0m \033[2m{m_short} │ {elapsed:.0f}s │ "
                     f"↑ {format_tokens(input_tokens)} ↓ {format_tokens(output_tokens)} (ESC to stop)\033[0m"
                 )
                 sys.stdout.flush()
@@ -2854,7 +2855,8 @@ def call_ollama(messages, model_override=None):
         result["message"]["tool_calls"] = tool_calls_data
 
     # Print per-request timing
-    print(f"  \033[2m⏱ qwen {duration:.1f}s │ ↑ {format_tokens(input_tokens)} ↓ {format_tokens(output_tokens)}\033[0m")
+    model_short = MODEL.split(":")[1] if ":" in MODEL else MODEL
+    print(f"  \033[2m⏱ {model_short} {duration:.1f}s │ ↑ {format_tokens(input_tokens)} ↓ {format_tokens(output_tokens)}\033[0m")
 
     return result
 
