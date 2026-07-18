@@ -2118,11 +2118,12 @@ Rules:
 - Each task touches exactly ONE file
 - Order by severity (critical first)
 - If no issues found, return an empty array: []
-- Maximum 30 fix tasks (prioritize critical issues)
-- Prefer providing old_text + new_text when possible (guarantees correct fix)"""
+- Maximum 15 fix tasks per pass (prioritize critical issues — more passes will follow if needed)
+- Prefer providing old_text + new_text when possible (guarantees correct fix)
+- Keep task titles and details concise to avoid output truncation"""
 
     print("  \033[2mCalling Sonnet for cross-module analysis...\033[0m")
-    response = call_claude_api(reconcile_prompt, max_tokens=8192)
+    response = call_claude_api(reconcile_prompt, max_tokens=16384)
 
     if not response:
         print("  \033[31m✗ Failed to get response from Sonnet.\033[0m")
@@ -2134,9 +2135,20 @@ Rules:
         cleaned = re.sub(r'```\s*$', '', cleaned.strip())
         fix_tasks = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"  \033[31m✗ Failed to parse Sonnet response: {e}\033[0m")
-        print(f"  Raw response (first 500 chars): {response[:500]}")
-        return
+        # Try to salvage truncated JSON by closing the array
+        try:
+            last_brace = cleaned.rfind('}')
+            if last_brace > 0:
+                salvaged = cleaned[:last_brace + 1] + ']'
+                fix_tasks = json.loads(salvaged)
+                print(f"  \033[33m⚠ Response was truncated — salvaged {len(fix_tasks)} tasks from partial output.\033[0m")
+            else:
+                raise ValueError("No recoverable JSON")
+        except (json.JSONDecodeError, ValueError):
+            print(f"  \033[31m✗ Failed to parse Sonnet response: {e}\033[0m")
+            print(f"  \033[2mResponse was likely truncated. Retrying with smaller scope...\033[0m")
+            print(f"  Raw response (first 500 chars): {response[:500]}")
+            return
 
     if not isinstance(fix_tasks, list):
         print("  \033[31m✗ Unexpected response format from Sonnet.\033[0m")
