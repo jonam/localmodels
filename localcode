@@ -1738,9 +1738,143 @@ def plan_compare():
     print()
 
 
+def _is_git_repo():
+    """Check if WORKDIR is inside a git repository."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, cwd=WORKDIR
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _git_has_uncommitted():
+    """Check if there are uncommitted changes in the working tree."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True, cwd=WORKDIR
+    )
+    return bool(result.stdout.strip())
+
+
+def plan_ab_reset():
+    """Reset project for A/B testing — save current run on a branch, clean for next model.
+
+    Git workflow: commit current state to a branch named after the model, then reset
+    working tree to the pre-plan state so the next model starts clean.
+    Non-git: warn and confirm before wiping generated files.
+    """
+    plan = plan_load()
+    if not plan:
+        print("  No plan found.")
+        return
+    runs = plan.get("runs", {})
+    if not runs:
+        print("  No completed runs to save. Run /plan run first.")
+        return
+
+    # Determine which model just ran
+    last_model = list(runs.keys())[-1]
+    model_short = last_model.split(":")[1] if ":" in last_model else last_model
+    model_branch = f"localcode-run-{model_short.replace('_', '-')}"
+
+    if _is_git_repo():
+        # Git-based A/B: save current state on a branch, then reset
+        print(f"\n  \033[1mA/B Reset (git mode)\033[0m")
+        print(f"  Current run ({model_short}) will be saved to branch: \033[1m{model_branch}\033[0m")
+        print(f"  Working tree will be restored to pre-plan state.")
+
+        if _git_has_uncommitted():
+            if not ask_permission("run", f"git add + commit all changes to branch '{model_branch}'"):
+                print("  Aborted.")
+                return
+
+            # Create/switch to model branch and commit
+            subprocess.run(["git", "checkout", "-B", model_branch], cwd=WORKDIR,
+                           capture_output=True, text=True)
+            subprocess.run(["git", "add", "-A"], cwd=WORKDIR, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m",
+                           f"localcode A/B: {model_short} run ({runs[last_model].get('tasks_completed', '?')} tasks, "
+                           f"{runs[last_model].get('reconcile_passes', '?')} reconcile passes)"],
+                          cwd=WORKDIR, capture_output=True, text=True)
+            print(f"  \033[32m✓ Committed to branch: {model_branch}\033[0m")
+        else:
+            print(f"  \033[2mNo changes to commit — working tree is clean.\033[0m")
+
+        # Switch back to original branch and reset working tree
+        # Find the original branch (main/master or whatever was checked out)
+        result = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                               capture_output=True, text=True, cwd=WORKDIR)
+        current = result.stdout.strip()
+        # If we're on the model branch, go back to main
+        if current == model_branch:
+            # Find default branch
+            for branch in ("main", "master"):
+                check = subprocess.run(["git", "rev-parse", "--verify", branch],
+                                      capture_output=True, text=True, cwd=WORKDIR)
+                if check.returncode == 0:
+                    subprocess.run(["git", "checkout", branch], cwd=WORKDIR,
+                                  capture_output=True, text=True)
+                    print(f"  \033[32m✓ Switched back to {branch}\033[0m")
+                    break
+
+        print(f"  \033[32m✓ Working tree clean for next model run.\033[0m")
+    else:
+        # Non-git: warn heavily before wiping
+        print(f"\n  \033[1;33m⚠ WARNING: No git repository detected.\033[0m")
+        print(f"  Generated code will be \033[1;31mPERMANENTLY DELETED\033[0m.")
+        print(f"  There is no way to recover it without git.")
+        print(f"\n  Consider initializing git first:")
+        print(f"    git init && git add -A && git commit -m 'save {model_short} run'")
+        print()
+        if not ask_permission("run", f"DELETE all generated files for A/B reset (NO UNDO)"):
+            print("  Aborted. Initialize git to use branch-based A/B testing.")
+            return
+        # Wipe generated files
+        generated = set()
+        for path, _ in UNDO_HISTORY:
+            if os.path.isfile(path) and ".localcode" not in path:
+                generated.add(path)
+        for f in generated:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        print(f"  \033[32m✓ Deleted {len(generated)} generated files.\033[0m")
+
+    # Reset plan tasks but preserve run stats
+    for t in plan["tasks"]:
+        t["status"] = "pending"
+        t.pop("last_error", None)
+        t.pop("attempts", None)
+    plan["current"] = 0
+    plan.pop("reconciled", None)
+    plan["reconcile_passes"] = 0
+    with open(PLAN_FILE, "w") as f:
+        json.dump(plan, f, indent=2)
+    UNDO_HISTORY.clear()
+    MARKS.clear()
+    print(f"\n  \033[32m✓ Plan reset. Run stats preserved ({len(runs)} model(s) recorded).\033[0m")
+    print(f"  Next: \033[1m/plan run q8\033[0m (or /plan run <model>)")
+
+
 def plan_nuke(keep_code=False):
     """Tear down everything: destroy infra, wipe plan, optionally wipe generated files."""
     plan = plan_load()
+
+    # Safety check: refuse to wipe code that's tracked in git
+    if not keep_code and _is_git_repo():
+        result = subprocess.run(["git", "status", "--porcelain"],
+                               capture_output=True, text=True, cwd=WORKDIR)
+        tracked_generated = [l[3:] for l in result.stdout.splitlines()
+                            if l.startswith(" M") or l.startswith("A ")]
+        if tracked_generated or not result.stdout.strip():
+            print(f"  \033[1;33m⚠ Generated code is tracked by git.\033[0m")
+            print(f"  Will NOT delete git-tracked files. Use 'git reset' if you want to undo.")
+            print(f"  Switching to: nuke keep (destroy infra + wipe plan, keep code)")
+            keep_code = True
 
     # Step 1: Terraform destroy if .tf files exist
     tf_dir = None
@@ -2065,6 +2199,8 @@ def handle_plan_command(args_str, messages):
         plan_run(messages, model_override=model_arg)
     elif subcmd == "compare":
         plan_compare()
+    elif subcmd == "ab":
+        plan_ab_reset()
     elif subcmd == "hint":
         # /plan hint <suggestion> — apply user's fix hint to the failed task
         if len(parts) < 2 or not parts[1].strip():
@@ -2163,6 +2299,7 @@ def handle_plan_command(args_str, messages):
   /plan run           - Start/resume executing tasks
   /plan run q8        - Run with Q8 model (A/B comparison)
   /plan run q4        - Run with Q4 model explicitly
+  /plan ab            - Save current run to git branch, reset for next model
   /plan compare       - Show side-by-side A/B model comparison
   /plan reconcile     - Analyze all files for cross-module issues, emit fix tasks
   /plan hint <text>   - Give a fix suggestion for a failed task and retry
@@ -3157,6 +3294,7 @@ def handle_command(user_input, messages):
   /plan <file>      - Create execution plan from document
   /plan run         - Execute plan tasks sequentially
   /plan run q8      - A/B test with Q8 model
+  /plan ab          - Save run to branch, reset for next model
   /plan compare     - Compare model runs side-by-side
   /plan status      - Show plan progress
   /help             - Show this help
