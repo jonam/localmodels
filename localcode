@@ -1768,8 +1768,8 @@ GENERATED SOURCE FILES:
 OUTPUT FORMAT — respond with ONLY a JSON array of fix tasks. Each task must be a SURGICAL edit:
 [
   {{
-    "title": "EDIT path/to/file.ext — Change X to Y (reason: port mismatch with other/file.ext)",
-    "details": "Replace `old_exact_text` with `new_exact_text`",
+    "title": "EDIT path/to/file.ext — Short summary of the fix",
+    "details": "Verbose description for the executing agent (see below)",
     "old_text": "the exact text to find in the file (enough context to be unique)",
     "new_text": "the exact replacement text",
     "severity": "critical|medium"
@@ -1780,19 +1780,30 @@ Also include DELETE tasks for dead code files:
 [
   {{
     "title": "DELETE path/to/dead_file.py — Uses deprecated AWS Voice ID (unavailable for new accounts)",
-    "details": "Remove entire file",
+    "details": "Remove entire file. This file uses AWS Voice ID which is unavailable for new accounts.",
     "old_text": "",
     "new_text": "",
     "severity": "critical"
   }}
 ]
 
+DETAILS FIELD (critical — this is the only spec the executing agent sees):
+The agent executing these fixes is Qwen3-Coder-30B with limited context and no memory.
+When old_text/new_text are provided, the agent can do an exact find-replace. But when they
+are NOT provided (complex rewrites, multi-line changes), the details field must contain:
+- The exact current code that is wrong and WHY it's wrong
+- The exact corrected code or exact steps to fix it
+- Exact import paths, variable names, function signatures to use
+- Which other file defines the correct value (e.g., "terraform/lambda.tf sets EC2_URL, not EC2_COMPARE_ENDPOINT")
+- 3-8 lines, maximally specific. The agent cannot infer — spell it out.
+
 Rules:
 - old_text must be EXACTLY as it appears in the file (copy-paste precision)
 - Each task touches exactly ONE file
 - Order by severity (critical first)
 - If no issues found, return an empty array: []
-- Maximum 30 fix tasks (prioritize critical issues)"""
+- Maximum 30 fix tasks (prioritize critical issues)
+- Prefer providing old_text + new_text when possible (guarantees correct fix)"""
 
     print("  \033[2mCalling Sonnet for cross-module analysis...\033[0m")
     response = call_claude_api(reconcile_prompt, max_tokens=8192)
