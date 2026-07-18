@@ -43,6 +43,10 @@ STATS = {
     "requests": 0,
     "start_time": None,
     "last_request_duration": 0,
+    # Sonnet (actual cost — Bedrock API calls)
+    "sonnet_input_tokens": 0,
+    "sonnet_output_tokens": 0,
+    "sonnet_requests": 0,
 }
 
 # Approximate pricing for equivalent Claude API usage (Sonnet 4.6 rates)
@@ -77,10 +81,13 @@ def print_stats_line(duration):
     """Print a session summary line after each agent_loop completes."""
     saved = (STATS["input_tokens"] * CLAUDE_INPUT_COST_PER_M +
              STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+    sonnet_cost = (STATS["sonnet_input_tokens"] * CLAUDE_INPUT_COST_PER_M +
+                   STATS["sonnet_output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
     total_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
+    sonnet_part = f" │ \033[33msonnet ${sonnet_cost:.2f}\033[0m\033[2m" if sonnet_cost > 0 else ""
     print(f"\n  \033[2m━━━ {format_duration(duration)} total │ "
           f"↑{format_tokens(STATS['input_tokens'])} ↓{format_tokens(STATS['output_tokens'])} cumulative │ "
-          f"\033[32m${saved:.2f} saved\033[0m\033[2m │ "
+          f"\033[32m${saved:.2f} saved\033[0m\033[2m{sonnet_part} │ "
           f"session {format_duration(total_time)} ━━━\033[0m\n")
 
 
@@ -1165,6 +1172,11 @@ def call_claude_api(prompt, max_tokens=4096):
             )
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read())
+                # Track Sonnet token usage
+                usage = data.get("usage", {})
+                STATS["sonnet_input_tokens"] += usage.get("input_tokens", 0)
+                STATS["sonnet_output_tokens"] += usage.get("output_tokens", 0)
+                STATS["sonnet_requests"] += 1
                 text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
                 if text_blocks:
                     return "\n".join(text_blocks)
@@ -2781,20 +2793,40 @@ def handle_command(user_input, messages):
             print(f"Switched to fast model: {MODEL}")
         return True
     elif cmd == "/cost":
-        total_tokens = STATS["input_tokens"] + STATS["output_tokens"]
-        input_cost = STATS["input_tokens"] * CLAUDE_INPUT_COST_PER_M / 1_000_000
-        output_cost = STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M / 1_000_000
-        total_cost = input_cost + output_cost
+        # Qwen (local/free) stats
+        qwen_total = STATS["input_tokens"] + STATS["output_tokens"]
+        qwen_input_cost = STATS["input_tokens"] * CLAUDE_INPUT_COST_PER_M / 1_000_000
+        qwen_output_cost = STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M / 1_000_000
+        qwen_saved = qwen_input_cost + qwen_output_cost
+        # Sonnet (actual spend) stats
+        sonnet_total = STATS["sonnet_input_tokens"] + STATS["sonnet_output_tokens"]
+        sonnet_input_cost = STATS["sonnet_input_tokens"] * CLAUDE_INPUT_COST_PER_M / 1_000_000
+        sonnet_output_cost = STATS["sonnet_output_tokens"] * CLAUDE_OUTPUT_COST_PER_M / 1_000_000
+        sonnet_spend = sonnet_input_cost + sonnet_output_cost
+        # Net savings
+        net_saved = qwen_saved - sonnet_spend
         session_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
         print(f"""
-  \033[1mSession stats\033[0m
+  \033[1mQwen (local — free)\033[0m
   ─────────────────────────────────────
-  Tokens in:   {format_tokens(STATS['input_tokens']):>8}  (≈${input_cost:.2f} if Claude Sonnet)
-  Tokens out:  {format_tokens(STATS['output_tokens']):>8}  (≈${output_cost:.2f} if Claude Sonnet)
-  Total:       {format_tokens(total_tokens):>8}
+  Tokens in:   {format_tokens(STATS['input_tokens']):>8}  (≈${qwen_input_cost:.2f} if Claude)
+  Tokens out:  {format_tokens(STATS['output_tokens']):>8}  (≈${qwen_output_cost:.2f} if Claude)
+  Total:       {format_tokens(qwen_total):>8}
   Requests:    {STATS['requests']:>8}
+
+  \033[1mSonnet (Bedrock — actual cost)\033[0m
   ─────────────────────────────────────
-  \033[32mYou saved:   ${total_cost:.2f}\033[0m
+  Tokens in:   {format_tokens(STATS['sonnet_input_tokens']):>8}   ${sonnet_input_cost:.3f}
+  Tokens out:  {format_tokens(STATS['sonnet_output_tokens']):>8}   ${sonnet_output_cost:.3f}
+  Total:       {format_tokens(sonnet_total):>8}
+  Requests:    {STATS['sonnet_requests']:>8}
+  \033[33mSpent:       ${sonnet_spend:.3f}\033[0m
+
+  \033[1mSummary\033[0m
+  ─────────────────────────────────────
+  \033[32mSaved:       ${qwen_saved:.2f}\033[0m  (Qwen did this for free)
+  \033[33mSpent:       ${sonnet_spend:.3f}\033[0m  (Sonnet planning/reconcile)
+  \033[1;32mNet saved:   ${net_saved:.2f}\033[0m
   Time:        {format_duration(session_time)}
   Model:       {MODEL}
   ─────────────────────────────────────""")
