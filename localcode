@@ -69,12 +69,14 @@ def format_duration(seconds):
     return f"{minutes}m{secs:.0f}s"
 
 
-def format_tokens(n):
+def format_tokens(n, label=True):
+    """Format token count. label=True appends ' tokens' for clarity in live displays."""
+    suffix = " tokens" if label else ""
     if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
+        return f"{n/1_000_000:.1f}M{suffix}"
     if n >= 1_000:
-        return f"{n/1_000:.1f}k"
-    return str(n)
+        return f"{n/1_000:.1f}k{suffix}"
+    return f"{n}{suffix}"
 
 
 def print_stats_line(duration):
@@ -86,7 +88,7 @@ def print_stats_line(duration):
     total_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
     sonnet_part = f" │ \033[33msonnet ${sonnet_cost:.2f}\033[0m\033[2m" if sonnet_cost > 0 else ""
     print(f"\n  \033[2m━━━ {format_duration(duration)} total │ "
-          f"↑{format_tokens(STATS['input_tokens'])} ↓{format_tokens(STATS['output_tokens'])} cumulative │ "
+          f"↑ {format_tokens(STATS['input_tokens'])} ↓ {format_tokens(STATS['output_tokens'])} cumulative │ "
           f"\033[32m${saved:.2f} saved\033[0m\033[2m{sonnet_part} │ "
           f"session {format_duration(total_time)} ━━━\033[0m\n")
 
@@ -1170,13 +1172,19 @@ def call_claude_api(prompt, max_tokens=4096):
                     "Authorization": auth_header,
                 },
             )
+            t_start = time.time()
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read())
                 # Track Sonnet token usage
                 usage = data.get("usage", {})
-                STATS["sonnet_input_tokens"] += usage.get("input_tokens", 0)
-                STATS["sonnet_output_tokens"] += usage.get("output_tokens", 0)
+                in_tok = usage.get("input_tokens", 0)
+                out_tok = usage.get("output_tokens", 0)
+                STATS["sonnet_input_tokens"] += in_tok
+                STATS["sonnet_output_tokens"] += out_tok
                 STATS["sonnet_requests"] += 1
+                duration = time.time() - t_start
+                cost = (in_tok * CLAUDE_INPUT_COST_PER_M + out_tok * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+                print(f"  \033[2m⏱ sonnet {duration:.1f}s │ ↑ {format_tokens(in_tok)} ↓ {format_tokens(out_tok)} │ ${cost:.3f}\033[0m")
                 text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
                 if text_blocks:
                     return "\n".join(text_blocks)
@@ -2485,13 +2493,13 @@ def parse_tool_calls_from_text(text):
 
 
 def call_ollama(messages, model_override=None):
-    """Call Ollama API with spinner, ESC-to-interrupt, and token tracking."""
+    """Call Ollama API with streaming, live token counter, ESC-to-interrupt."""
     num_threads = max(4, (os.cpu_count() or 8) - 2)
     payload = json.dumps({
         "model": model_override or MODEL,
         "messages": messages,
         "tools": TOOLS,
-        "stream": False,
+        "stream": True,
         "options": {
             "num_thread": num_threads,
             "num_ctx": 32768,
@@ -2510,49 +2518,85 @@ def call_ollama(messages, model_override=None):
     STATS["input_tokens"] += input_tokens
 
     INTERRUPTED.clear()
-    result = [None]
-    error = [None]
     t_start = time.time()
 
-    def do_request():
-        try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                result[0] = json.loads(resp.read())
-        except Exception as e:
-            error[0] = e
-
-    # Run request in background, watch for ESC in foreground
-    thread = threading.Thread(target=do_request, daemon=True)
+    # Start ESC watcher
     watcher = threading.Thread(target=watch_for_input, daemon=True)
-
-    thread.start()
     watcher.start()
 
-    # Spinner with elapsed time while waiting
+    # Stream response with live token counter
     spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     spin_idx = 0
+    output_tokens = 0
+    content_chunks = []
+    tool_calls_data = []
+    final_data = None
 
-    while thread.is_alive():
-        if INTERRUPTED.is_set():
-            sys.stdout.write("\r\033[K")  # clear spinner line
-            sys.stdout.flush()
-            print("  \033[33m[interrupted — press ESC or Ctrl+C]\033[0m")
-            raise InterruptedError()
-        elapsed = time.time() - t_start
-        spinner = spinner_chars[spin_idx % len(spinner_chars)]
-        sys.stdout.write(f"\r  \033[36m{spinner}\033[0m \033[2mthinking... {elapsed:.0f}s (ESC to stop)\033[0m")
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for line in resp:
+                if INTERRUPTED.is_set():
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                    print("  \033[33m[interrupted — press ESC or Ctrl+C]\033[0m")
+                    raise InterruptedError()
+
+                if not line.strip():
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("done"):
+                    final_data = chunk
+                    # Use actual token counts from Ollama if available
+                    if "eval_count" in chunk:
+                        output_tokens = chunk["eval_count"]
+                    if "prompt_eval_count" in chunk:
+                        input_tokens = chunk["prompt_eval_count"]
+                    break
+
+                # Accumulate content
+                msg = chunk.get("message", {})
+                token_text = msg.get("content", "")
+                if token_text:
+                    content_chunks.append(token_text)
+                    output_tokens += 1
+
+                # Accumulate tool calls if present
+                if msg.get("tool_calls"):
+                    tool_calls_data.extend(msg["tool_calls"])
+
+                # Update live display with rising token counter
+                elapsed = time.time() - t_start
+                spinner = spinner_chars[spin_idx % len(spinner_chars)]
+                sys.stdout.write(
+                    f"\r  \033[36m{spinner}\033[0m \033[2mqwen │ {elapsed:.0f}s │ "
+                    f"↑ {format_tokens(input_tokens)} ↓ {format_tokens(output_tokens)} (ESC to stop)\033[0m"
+                )
+                sys.stdout.flush()
+                spin_idx += 1
+
+    except InterruptedError:
+        raise
+    except Exception as e:
+        sys.stdout.write("\r\033[K")
         sys.stdout.flush()
-        spin_idx += 1
-        thread.join(timeout=0.15)
+        # Stop watcher
+        INTERRUPTED.set()
+        watcher.join(timeout=0.5)
+        INTERRUPTED.clear()
+        raise e
 
-    # Clear spinner line
+    # Clear the live counter line
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
 
-    # Stop the watcher thread, then clear the flag so it doesn't
-    # falsely trigger "plan paused" in plan_run
+    # Stop the watcher thread
     was_interrupted = INTERRUPTED.is_set()
-    INTERRUPTED.set()  # stop the watcher
+    INTERRUPTED.set()
     watcher.join(timeout=0.5)
     if not was_interrupted:
         INTERRUPTED.clear()
@@ -2560,22 +2604,23 @@ def call_ollama(messages, model_override=None):
     duration = time.time() - t_start
     STATS["last_request_duration"] = duration
     STATS["requests"] += 1
-
-    if error[0]:
-        raise error[0]
-
-    # Track output tokens from response
-    resp_msg = result[0].get("message", {})
-    output_text = resp_msg.get("content", "")
-    if resp_msg.get("tool_calls"):
-        output_text += json.dumps(resp_msg["tool_calls"])
-    output_tokens = estimate_tokens(output_text)
     STATS["output_tokens"] += output_tokens
 
-    # Print per-request timing
-    print(f"  \033[2m⏱ {duration:.1f}s │ ↑{format_tokens(input_tokens)} ↓{format_tokens(output_tokens)}\033[0m")
+    # Reconstruct the response in the same format as non-streaming
+    full_content = "".join(content_chunks)
+    result = {
+        "message": {
+            "role": "assistant",
+            "content": full_content,
+        }
+    }
+    if tool_calls_data:
+        result["message"]["tool_calls"] = tool_calls_data
 
-    return result[0]
+    # Print per-request timing
+    print(f"  \033[2m⏱ qwen {duration:.1f}s │ ↑ {format_tokens(input_tokens)} ↓ {format_tokens(output_tokens)}\033[0m")
+
+    return result
 
 
 def format_action(fn_name, fn_args):
@@ -2809,16 +2854,16 @@ def handle_command(user_input, messages):
         print(f"""
   \033[1mQwen (local — free)\033[0m
   ─────────────────────────────────────
-  Tokens in:   {format_tokens(STATS['input_tokens']):>8}  (≈${qwen_input_cost:.2f} if Claude)
-  Tokens out:  {format_tokens(STATS['output_tokens']):>8}  (≈${qwen_output_cost:.2f} if Claude)
-  Total:       {format_tokens(qwen_total):>8}
+  Tokens in:   {format_tokens(STATS['input_tokens'], label=False):>8}  (≈${qwen_input_cost:.2f} if Claude)
+  Tokens out:  {format_tokens(STATS['output_tokens'], label=False):>8}  (≈${qwen_output_cost:.2f} if Claude)
+  Total:       {format_tokens(qwen_total, label=False):>8}
   Requests:    {STATS['requests']:>8}
 
   \033[1mSonnet (Bedrock — actual cost)\033[0m
   ─────────────────────────────────────
-  Tokens in:   {format_tokens(STATS['sonnet_input_tokens']):>8}   ${sonnet_input_cost:.3f}
-  Tokens out:  {format_tokens(STATS['sonnet_output_tokens']):>8}   ${sonnet_output_cost:.3f}
-  Total:       {format_tokens(sonnet_total):>8}
+  Tokens in:   {format_tokens(STATS['sonnet_input_tokens'], label=False):>8}   ${sonnet_input_cost:.3f}
+  Tokens out:  {format_tokens(STATS['sonnet_output_tokens'], label=False):>8}   ${sonnet_output_cost:.3f}
+  Total:       {format_tokens(sonnet_total, label=False):>8}
   Requests:    {STATS['sonnet_requests']:>8}
   \033[33mSpent:       ${sonnet_spend:.3f}\033[0m
 
