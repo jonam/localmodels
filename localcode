@@ -1115,8 +1115,13 @@ def verify_task(task, task_messages):
     return True, ""
 
 
-def call_claude_api(prompt, max_tokens=4096):
-    """Call Claude Sonnet via AWS Bedrock. Uses AWS credentials from env. Returns text or None."""
+OPUS_INPUT_COST_PER_M = 15.00
+OPUS_OUTPUT_COST_PER_M = 75.00
+
+
+def call_claude_api(prompt, max_tokens=4096, model=None):
+    """Call Claude via AWS Bedrock. Uses AWS credentials from env. Returns text or None.
+    model: 'sonnet' (default), 'opus', or a full model ID."""
     import hashlib
     import hmac as hmac_mod
     import datetime
@@ -1146,7 +1151,17 @@ def call_claude_api(prompt, max_tokens=4096):
             if profile_section in cfg:
                 region = cfg[profile_section].get("region", region)
 
-    model_id = os.environ.get("LOCALCODE_CLAUDE_MODEL", "us.anthropic.claude-sonnet-4-6")
+    # Resolve model ID
+    MODEL_IDS = {
+        "sonnet": "us.anthropic.claude-sonnet-4-6",
+        "opus": "us.anthropic.claude-opus-4-6-v1",
+    }
+    if model and model in MODEL_IDS:
+        model_id = MODEL_IDS[model]
+    elif model and "." in model:
+        model_id = model
+    else:
+        model_id = os.environ.get("LOCALCODE_CLAUDE_MODEL", "us.anthropic.claude-sonnet-4-6")
 
     if access_key and secret_key:
         try:
@@ -1202,9 +1217,10 @@ def call_claude_api(prompt, max_tokens=4096):
                 },
             )
             t_start = time.time()
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            is_opus = "opus" in model_id
+            timeout = 300 if is_opus else 120
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
-                # Track Sonnet token usage
                 usage = data.get("usage", {})
                 in_tok = usage.get("input_tokens", 0)
                 out_tok = usage.get("output_tokens", 0)
@@ -1212,8 +1228,12 @@ def call_claude_api(prompt, max_tokens=4096):
                 STATS["sonnet_output_tokens"] += out_tok
                 STATS["sonnet_requests"] += 1
                 duration = time.time() - t_start
-                cost = (in_tok * CLAUDE_INPUT_COST_PER_M + out_tok * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
-                print(f"  \033[2m⏱ sonnet {duration:.1f}s │ ↑ {format_tokens(in_tok)} ↓ {format_tokens(out_tok)} │ ${cost:.3f}\033[0m")
+                # Use correct pricing based on model
+                in_cost_rate = OPUS_INPUT_COST_PER_M if is_opus else CLAUDE_INPUT_COST_PER_M
+                out_cost_rate = OPUS_OUTPUT_COST_PER_M if is_opus else CLAUDE_OUTPUT_COST_PER_M
+                cost = (in_tok * in_cost_rate + out_tok * out_cost_rate) / 1_000_000
+                model_label = "opus" if is_opus else "sonnet"
+                print(f"  \033[2m⏱ {model_label} {duration:.1f}s │ ↑ {format_tokens(in_tok)} ↓ {format_tokens(out_tok)} │ ${cost:.3f}\033[0m")
                 text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
                 if text_blocks:
                     return "\n".join(text_blocks)
@@ -1615,17 +1635,22 @@ RULES (follow strictly):
 
         if plan.get("reconciled"):
             print(f"  \033[32m✓ Reconciliation complete — all cross-module issues resolved.\033[0m")
-        elif reconcile_count >= 5:
-            print(f"  \033[33m⚠ Reached max reconciliation passes (5). Run /plan reconcile manually if needed.\033[0m")
-        elif len(history) >= 2 and history[-1] >= history[-2]:
+        elif reconcile_count >= 7:
+            print(f"  \033[33m⚠ Reached max reconciliation passes (7). Run /plan reconcile --opus manually if needed.\033[0m")
+        elif len(history) >= 2 and history[-1] >= history[-2] and reconcile_count >= 5:
             print(f"  \033[33m⚠ Reconciliation not converging (pass {len(history)-1}: {history[-2]} issues → pass {len(history)}: {history[-1]} issues).\033[0m")
             print(f"  \033[33m  Issues are not decreasing — manual review needed.\033[0m")
             print(f"  \033[2m  History: {' → '.join(str(h) for h in history)}\033[0m")
         else:
-            print(f"\n  \033[1;36m⟳ Running cross-module reconciliation pass {reconcile_count + 1} (Sonnet)...\033[0m")
+            # Auto-escalate to Opus after 3 Sonnet passes
+            escalate_to_opus = reconcile_count >= 3
+            if escalate_to_opus:
+                print(f"\n  \033[1;35m⟳ Escalating to Opus for reconciliation pass {reconcile_count + 1} (deeper analysis)...\033[0m")
+            else:
+                print(f"\n  \033[1;36m⟳ Running cross-module reconciliation pass {reconcile_count + 1} (Sonnet)...\033[0m")
             if history:
                 print(f"  \033[2m  Issue history: {' → '.join(str(h) for h in history)}\033[0m")
-            plan_reconcile()
+            plan_reconcile(use_opus=escalate_to_opus)
             # If reconcile added new tasks, auto-continue
             updated_plan = plan_load()
             if updated_plan and any(t["status"] == "pending" for t in updated_plan["tasks"]):
@@ -1993,9 +2018,10 @@ def plan_nuke(keep_code=False):
     print(f"\n  \033[32m✓ Clean slate. Run /plan <file> to start fresh.\033[0m")
 
 
-def plan_reconcile():
+def plan_reconcile(use_opus=False):
     """Analyze all generated files for cross-module inconsistencies and emit surgical fix tasks.
-    Uses Sonnet via Bedrock to detect issues, then appends concrete EDIT tasks to the plan."""
+    Uses Claude via Bedrock to detect issues, then appends concrete EDIT tasks to the plan.
+    use_opus=True uses Opus for deeper analysis (auto-escalated after 3 Sonnet passes)."""
     plan = plan_load()
     if not plan:
         print("  No plan found.")
@@ -2130,8 +2156,33 @@ Rules:
 - Prefer providing old_text + new_text when possible (guarantees correct fix)
 - Keep task titles and details concise to avoid output truncation"""
 
-    print("  \033[2mCalling Sonnet for cross-module analysis...\033[0m")
-    response = call_claude_api(reconcile_prompt, max_tokens=16384)
+    # Opus gets additional AWS/infrastructure-specific checks
+    if use_opus:
+        reconcile_prompt += """
+
+ADDITIONAL DEEP CHECKS (Opus-level analysis):
+9. TERRAFORM VPC SEMANTICS — EC2 instances in a VPC with subnet_id MUST use vpc_security_group_ids (with SG IDs), NOT security_groups (which uses SG names and only works in EC2-Classic)
+10. API GATEWAY PATH STRUCTURE — path_part cannot contain '/'. Nested paths like /voice/compare require nested aws_api_gateway_resource resources (parent resource for 'voice', child for 'compare')
+11. LAMBDA VPC CONFIG — if Lambda needs to reach EC2 via private IP, it MUST have a vpc_config block with subnet_ids and security_group_ids. Without this, Lambda runs outside the VPC.
+12. MISSING FILE DETECTION — if any source file imports/requires a module that does not exist in the file listing above, emit a CREATE task (title: "CREATE path/to/missing.ext — Required by <importer>")
+13. TERRAFORM VARIABLE CONSISTENCY — check that variable names used in resources match what's declared in variables.tf AND what's set in terraform.tfvars
+14. CIRCULAR DEPENDENCIES — if two Terraform resources reference each other directly, they must be broken into separate aws_security_group_rule resources
+15. HANDLER FORMAT — Node.js Lambda handler must be 'filename.exportName' (e.g. 'index.handler'), NOT 'filename.ext'
+16. IAM ROLE DEDUPLICATION — if multiple IAM roles serve the same purpose, flag the unused one as dead code for deletion
+
+For CREATE tasks (missing files), provide full file content in the details field:
+{{
+  "title": "CREATE path/to/missing_file.js — Required by <importer>",
+  "details": "Create this file with the following content:\\n```\\n<full file content here>\\n```",
+  "old_text": "",
+  "new_text": "",
+  "severity": "critical"
+}}"""
+
+    claude_model = "opus" if use_opus else None
+    model_label = "Opus" if use_opus else "Sonnet"
+    print(f"  \033[2mCalling {model_label} for cross-module analysis...\033[0m")
+    response = call_claude_api(reconcile_prompt, max_tokens=16384, model=claude_model)
 
     if not response:
         print("  \033[31m✗ Failed to get response from Sonnet.\033[0m")
@@ -2320,7 +2371,8 @@ def handle_plan_command(args_str, messages):
         else:
             print("  No plan found.")
     elif subcmd == "reconcile":
-        plan_reconcile()
+        use_opus = len(parts) > 1 and "--opus" in parts[1]
+        plan_reconcile(use_opus=use_opus)
     elif subcmd == "split":
         plan_split()
     elif subcmd == "nuke":
@@ -2362,7 +2414,8 @@ def handle_plan_command(args_str, messages):
   /plan run q4        - Run with Q4 model explicitly
   /plan ab            - Save current run to git branch, reset for next model
   /plan compare       - Show side-by-side A/B model comparison
-  /plan reconcile     - Analyze all files for cross-module issues, emit fix tasks
+  /plan reconcile     - Analyze all files for cross-module issues (Sonnet)
+  /plan reconcile --opus - Deep analysis with Opus (auto-escalates after 3 passes)
   /plan hint <text>   - Give a fix suggestion for a failed task and retry
   /plan retry         - Reset failed task and retry from scratch
   /plan rollback      - Undo current task's file changes
