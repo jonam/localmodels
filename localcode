@@ -47,6 +47,10 @@ STATS = {
     "sonnet_input_tokens": 0,
     "sonnet_output_tokens": 0,
     "sonnet_requests": 0,
+    # Opus (actual cost — Bedrock API calls)
+    "opus_input_tokens": 0,
+    "opus_output_tokens": 0,
+    "opus_requests": 0,
 }
 
 # Approximate pricing for equivalent Claude API usage (Sonnet 4.6 rates)
@@ -83,6 +87,9 @@ def stats_delta(before, after):
         "sonnet_input_tokens": after["sonnet_input_tokens"] - before["sonnet_input_tokens"],
         "sonnet_output_tokens": after["sonnet_output_tokens"] - before["sonnet_output_tokens"],
         "sonnet_requests": after["sonnet_requests"] - before["sonnet_requests"],
+        "opus_input_tokens": after["opus_input_tokens"] - before["opus_input_tokens"],
+        "opus_output_tokens": after["opus_output_tokens"] - before["opus_output_tokens"],
+        "opus_requests": after["opus_requests"] - before["opus_requests"],
     }
 
 
@@ -102,11 +109,18 @@ def print_stats_line(duration):
              STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
     sonnet_cost = (STATS["sonnet_input_tokens"] * CLAUDE_INPUT_COST_PER_M +
                    STATS["sonnet_output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+    opus_cost = (STATS["opus_input_tokens"] * OPUS_INPUT_COST_PER_M +
+                 STATS["opus_output_tokens"] * OPUS_OUTPUT_COST_PER_M) / 1_000_000
     total_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
-    sonnet_part = f" │ \033[33msonnet ${sonnet_cost:.2f}\033[0m\033[2m" if sonnet_cost > 0 else ""
+    cost_parts = []
+    if sonnet_cost > 0:
+        cost_parts.append(f"sonnet ${sonnet_cost:.2f}")
+    if opus_cost > 0:
+        cost_parts.append(f"opus ${opus_cost:.2f}")
+    cost_str = f" │ \033[33m{' │ '.join(cost_parts)}\033[0m\033[2m" if cost_parts else ""
     print(f"\n  \033[2m━━━ {format_duration(duration)} total │ "
           f"↑ {format_tokens(STATS['input_tokens'])} ↓ {format_tokens(STATS['output_tokens'])} cumulative │ "
-          f"\033[32m${saved:.2f} saved\033[0m\033[2m{sonnet_part} │ "
+          f"\033[32m${saved:.2f} saved\033[0m\033[2m{cost_str} │ "
           f"session {format_duration(total_time)} ━━━\033[0m\n")
 
 
@@ -1224,9 +1238,14 @@ def call_claude_api(prompt, max_tokens=4096, model=None):
                 usage = data.get("usage", {})
                 in_tok = usage.get("input_tokens", 0)
                 out_tok = usage.get("output_tokens", 0)
-                STATS["sonnet_input_tokens"] += in_tok
-                STATS["sonnet_output_tokens"] += out_tok
-                STATS["sonnet_requests"] += 1
+                if is_opus:
+                    STATS["opus_input_tokens"] += in_tok
+                    STATS["opus_output_tokens"] += out_tok
+                    STATS["opus_requests"] += 1
+                else:
+                    STATS["sonnet_input_tokens"] += in_tok
+                    STATS["sonnet_output_tokens"] += out_tok
+                    STATS["sonnet_requests"] += 1
                 duration = time.time() - t_start
                 # Use correct pricing based on model
                 in_cost_rate = OPUS_INPUT_COST_PER_M if is_opus else CLAUDE_INPUT_COST_PER_M
@@ -1642,20 +1661,23 @@ RULES (follow strictly):
             print(f"  \033[33m  Issues are not decreasing — manual review needed.\033[0m")
             print(f"  \033[2m  History: {' → '.join(str(h) for h in history)}\033[0m")
         else:
-            # Auto-escalate to Opus after 3 Sonnet passes
+            # Auto-escalate to Opus-direct after 3 Sonnet passes
             escalate_to_opus = reconcile_count >= 3
             if escalate_to_opus:
-                print(f"\n  \033[1;35m⟳ Escalating to Opus for reconciliation pass {reconcile_count + 1} (deeper analysis)...\033[0m")
+                print(f"\n  \033[1;35m⟳ Escalating to Opus-direct for reconciliation pass {reconcile_count + 1} (find + fix in one shot)...\033[0m")
+                if history:
+                    print(f"  \033[2m  Issue history: {' → '.join(str(h) for h in history)}\033[0m")
+                plan_reconcile_direct()
             else:
                 print(f"\n  \033[1;36m⟳ Running cross-module reconciliation pass {reconcile_count + 1} (Sonnet)...\033[0m")
-            if history:
-                print(f"  \033[2m  Issue history: {' → '.join(str(h) for h in history)}\033[0m")
-            plan_reconcile(use_opus=escalate_to_opus)
-            # If reconcile added new tasks, auto-continue
-            updated_plan = plan_load()
-            if updated_plan and any(t["status"] == "pending" for t in updated_plan["tasks"]):
-                print(f"\n  \033[1;36m▶ Executing reconciliation fix tasks...\033[0m")
-                plan_run(messages, model_override=model_override)
+                if history:
+                    print(f"  \033[2m  Issue history: {' → '.join(str(h) for h in history)}\033[0m")
+                plan_reconcile(use_opus=False)
+                # If reconcile added new tasks, auto-continue
+                updated_plan = plan_load()
+                if updated_plan and any(t["status"] == "pending" for t in updated_plan["tasks"]):
+                    print(f"\n  \033[1;36m▶ Executing reconciliation fix tasks...\033[0m")
+                    plan_run(messages, model_override=model_override)
     else:
         remaining = [t for t in tasks if t["status"] != "done"]
         print(f"\n  \033[33m{done}/{total} tasks complete. Next: task {remaining[0]['id']}\033[0m")
@@ -1794,9 +1816,12 @@ def _plan_pause_repl():
                          STATS["output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
             sonnet_spend = (STATS["sonnet_input_tokens"] * CLAUDE_INPUT_COST_PER_M +
                            STATS["sonnet_output_tokens"] * CLAUDE_OUTPUT_COST_PER_M) / 1_000_000
+            opus_spend = (STATS["opus_input_tokens"] * OPUS_INPUT_COST_PER_M +
+                         STATS["opus_output_tokens"] * OPUS_OUTPUT_COST_PER_M) / 1_000_000
+            total_spend = sonnet_spend + opus_spend
             session_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
             print(f"    Qwen: {format_tokens(qwen_total, label=False)} (≈${qwen_saved:.2f} saved) │ "
-                  f"Sonnet: ${sonnet_spend:.3f} │ Time: {format_duration(session_time)}")
+                  f"Sonnet: ${sonnet_spend:.3f} │ Opus: ${opus_spend:.3f} │ Time: {format_duration(session_time)}")
         elif cmd == "/status":
             plan_status()
         elif cmd == "/model":
@@ -2277,6 +2302,256 @@ For CREATE tasks (missing files), provide full file content in the details field
     print(f"  Run \033[1m/plan run\033[0m to apply fixes.")
 
 
+def plan_reconcile_direct():
+    """Opus-direct reconciliation: Opus finds AND applies fixes in a single pass.
+    No Qwen handoff — Opus returns exact edits which are applied directly."""
+    plan = plan_load()
+    if not plan:
+        print("  No plan found.")
+        return
+
+    has_claude = bool(os.environ.get("AWS_ACCESS_KEY_ID") or os.path.isfile(os.path.expanduser("~/.aws/credentials")))
+    if not has_claude:
+        print("  \033[33m⚠ No AWS credentials found. Cannot call Opus.\033[0m")
+        return
+
+    # Collect all source files
+    print("  \033[1;35m⟳ Opus-direct reconciliation (find + fix in one pass)...\033[0m")
+    print("  \033[2mCollecting source files...\033[0m")
+    source_extensions = {".py", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".tf", ".sh", ".json", ".html", ".css", ".yaml", ".yml", ".env", ".txt"}
+    include_filenames = {"Dockerfile", ".env.example", "requirements.txt"}
+    skip_dirs = {".localcode", "node_modules", ".terraform", ".git", "__pycache__", ".next", "venv"}
+    skip_files = {"package-lock.json", "yarn.lock"}
+
+    file_contents = {}
+    total_chars = 0
+    MAX_CONTEXT = 150000
+
+    for root, dirs, files in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in sorted(files):
+            if fname in skip_files:
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in source_extensions and fname not in include_filenames:
+                continue
+            fpath = os.path.join(root, fname)
+            rel_path = os.path.relpath(fpath, WORKDIR)
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+                if total_chars + len(content) > MAX_CONTEXT:
+                    continue
+                file_contents[rel_path] = content
+                total_chars += len(content)
+            except (IOError, UnicodeDecodeError):
+                pass
+
+    if not file_contents:
+        print("  No source files found to reconcile.")
+        return
+
+    print(f"  \033[2mLoaded {len(file_contents)} files ({total_chars // 1000}k chars)\033[0m")
+
+    # Build files block
+    files_block = ""
+    for rel_path, content in sorted(file_contents.items()):
+        files_block += f"\n{'='*60}\nFILE: {rel_path}\n{'='*60}\n{content}\n"
+
+    # Opus-direct prompt: find issues AND return the exact edits to apply
+    prompt = f"""You are a senior software architect performing a FINAL reconciliation pass on code generated by an AI model.
+
+YOUR JOB: Find ALL integration bugs, dead code, and deployment issues. Return the EXACT edits to fix them. This is a single-pass fix — be exhaustive.
+
+Focus on:
+1. PORT MISMATCHES — one file connects on port X, another listens on port Y
+2. API CONTRACT MISMATCHES — caller sends field_a, receiver expects field_b
+3. IMPORT/MODULE MISMATCHES — file imports path that doesn't exist or exports wrong name
+4. DEAD/ORPHAN FILES — files that are never imported, referenced, or deployed by any other file (DELETE them)
+5. DEAD IMPORTS — imported modules/packages that are never used in the file (remove the import)
+6. DUPLICATE/CONFLICTING IMPLEMENTATIONS — two files doing the same thing differently
+7. MISSING ENVIRONMENT VARIABLES — one file reads ENV_X, another sets ENV_Y for same purpose
+8. DEPENDENCY VERSION ISSUES — package.json listing packages that are never used, or requirements.txt with wrong framework
+9. TERRAFORM SEMANTICS — vpc_security_group_ids vs security_groups, nested API Gateway paths, Lambda VPC config
+10. HANDLER FORMAT — Lambda handler must be 'filename.handler' not 'filename.js'
+11. IAM/SECURITY GROUP DEDUPLICATION — multiple resources serving same purpose
+12. DEPLOYMENT OS MISMATCH — startup scripts using wrong package manager for the AMI/OS (e.g., apt-get on Amazon Linux which uses yum)
+13. EVENT FORMAT MISMATCH — Lambda handlers that only handle one invoke format (e.g., API Gateway event) but are also invoked by Step Functions (different event shape). Fix by supporting both formats.
+14. STATE MACHINE DESIGN — Step Functions with no retry/Choice loop (e.g., Wait→Check→End without looping back if job isn't complete)
+15. ORPHAN TERRAFORM FILES — source code files (e.g., .py handlers) that exist but have no corresponding aws_lambda_function resource to deploy them. DELETE the orphan files.
+16. STALE ROOT FILES — root-level Dockerfiles or requirements.txt that reference nonexistent files or wrong frameworks (DELETE if the correct versions exist in subdirectories)
+17. HARDCODED WRONG VALUES — thresholds, URLs, or config values that contradict what other files in the project use for the same purpose
+18. ENV VAR NAME MISMATCHES — .env.example defining REACT_APP_X but code reading REACT_APP_Y
+
+DO NOT flag: style issues, naming conventions, code quality suggestions, or features that are intentionally marked as TODOs.
+
+GENERATED SOURCE FILES:
+{files_block}
+
+OUTPUT FORMAT — respond with ONLY a JSON array. Each entry is one edit to apply:
+[
+  {{
+    "file": "path/to/file.ext",
+    "action": "edit",
+    "old_text": "exact text to find (copy-paste precision, enough context to be unique)",
+    "new_text": "exact replacement text"
+  }},
+  {{
+    "file": "path/to/dead_file.ext",
+    "action": "delete"
+  }},
+  {{
+    "file": "path/to/new_file.ext",
+    "action": "create",
+    "content": "full file content here"
+  }}
+]
+
+Rules:
+- old_text must be EXACTLY as it appears in the file (whitespace-precise)
+- Each entry touches exactly ONE file (multiple edits to the same file = multiple entries)
+- If no issues found, return: []
+- Be thorough — this is the ONLY pass. Fix everything in one shot.
+- For edits, include enough surrounding context in old_text to guarantee uniqueness"""
+
+    print(f"  \033[2mCalling Opus for direct reconciliation...\033[0m")
+    response = call_claude_api(prompt, max_tokens=32768, model="opus")
+
+    if not response:
+        print("  \033[31m✗ Failed to get response from Opus.\033[0m")
+        return
+
+    # Parse response — handle code fences, trailing text after JSON, and truncation
+    try:
+        cleaned = re.sub(r'^```(?:json)?\s*', '', response.strip())
+        cleaned = re.sub(r'```\s*$', '', cleaned.strip())
+        # Find the JSON array boundaries (first '[' to matching ']')
+        arr_start = cleaned.find('[')
+        if arr_start >= 0:
+            # Find the last ']' which closes the array
+            arr_end = cleaned.rfind(']')
+            if arr_end > arr_start:
+                cleaned = cleaned[arr_start:arr_end + 1]
+        edits = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError) as e:
+        try:
+            # Truncated response — close at last complete object
+            last_brace = cleaned.rfind('}')
+            if last_brace > 0:
+                salvaged = cleaned[:last_brace + 1] + ']'
+                edits = json.loads(salvaged)
+                print(f"  \033[33m⚠ Response truncated — salvaged {len(edits)} edits.\033[0m")
+            else:
+                raise ValueError("No recoverable JSON")
+        except (json.JSONDecodeError, ValueError):
+            print(f"  \033[31m✗ Failed to parse Opus response: {e}\033[0m")
+            print(f"  Raw (first 500 chars): {response[:500]}")
+            return
+
+    if not isinstance(edits, list):
+        print("  \033[31m✗ Unexpected response format.\033[0m")
+        return
+
+    if not edits:
+        print("  \033[32m✓ No cross-module issues found! Code is consistent.\033[0m")
+        plan["reconciled"] = True
+        plan["reconcile_passes"] = plan.get("reconcile_passes", 0) + 1
+        if "reconcile_history" not in plan:
+            plan["reconcile_history"] = []
+        plan["reconcile_history"].append(0)
+        with open(PLAN_FILE, "w") as f:
+            json.dump(plan, f, indent=2)
+        return
+
+    # Apply edits directly
+    print(f"\n  \033[1;35m⚡ Applying {len(edits)} fixes directly (Opus-direct)...\033[0m\n")
+    applied = 0
+    failed = 0
+
+    for i, edit in enumerate(edits, 1):
+        action = edit.get("action", "edit")
+        filepath = edit.get("file", "")
+        if not filepath:
+            failed += 1
+            continue
+
+        full_path = resolve_path(filepath)
+
+        if action == "delete":
+            if os.path.isfile(full_path):
+                save_undo(full_path)
+                os.remove(full_path)
+                print(f"  \033[31m[{i}] DELETE {filepath}\033[0m")
+                applied += 1
+            else:
+                print(f"  \033[33m[{i}] SKIP delete {filepath} (not found)\033[0m")
+                failed += 1
+
+        elif action == "create":
+            content = edit.get("content", "")
+            if content:
+                save_undo(full_path)
+                os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+                with open(full_path, "w") as f:
+                    f.write(content)
+                print(f"  \033[32m[{i}] CREATE {filepath}\033[0m")
+                applied += 1
+            else:
+                print(f"  \033[33m[{i}] SKIP create {filepath} (no content)\033[0m")
+                failed += 1
+
+        elif action == "edit":
+            old_text = edit.get("old_text", "")
+            new_text = edit.get("new_text", "")
+            if not old_text:
+                print(f"  \033[33m[{i}] SKIP {filepath} (no old_text)\033[0m")
+                failed += 1
+                continue
+
+            try:
+                with open(full_path) as f:
+                    content = f.read()
+            except FileNotFoundError:
+                print(f"  \033[33m[{i}] SKIP {filepath} (file not found)\033[0m")
+                failed += 1
+                continue
+
+            if old_text not in content:
+                print(f"  \033[33m[{i}] SKIP {filepath} (old_text not found)\033[0m")
+                failed += 1
+                continue
+
+            save_undo(full_path)
+            new_content = content.replace(old_text, new_text, 1)
+            with open(full_path, "w") as f:
+                f.write(new_content)
+            FILE_CACHE.pop(full_path, None)
+            title = filepath
+            if len(old_text) < 60:
+                title += f" — '{old_text[:40]}...'"
+            print(f"  \033[32m[{i}] EDIT  {title}\033[0m")
+            applied += 1
+        else:
+            print(f"  \033[33m[{i}] SKIP unknown action: {action}\033[0m")
+            failed += 1
+
+    # Update plan state
+    plan["reconcile_passes"] = plan.get("reconcile_passes", 0) + 1
+    if "reconcile_history" not in plan:
+        plan["reconcile_history"] = []
+    plan["reconcile_history"].append(len(edits))
+
+    if failed == 0:
+        plan["reconciled"] = True
+    with open(PLAN_FILE, "w") as f:
+        json.dump(plan, f, indent=2)
+
+    print(f"\n  \033[1;32m✓ Applied {applied}/{len(edits)} fixes directly")
+    if failed:
+        print(f"  \033[33m  ({failed} skipped — old_text mismatch or missing file)\033[0m")
+    print(f"  \033[2m  No Qwen execution needed — Opus applied fixes in 1 pass.\033[0m")
+
+
 def handle_plan_command(args_str, messages):
     """Handle /plan subcommands."""
     parts = args_str.strip().split(None, 1)
@@ -2371,8 +2646,11 @@ def handle_plan_command(args_str, messages):
         else:
             print("  No plan found.")
     elif subcmd == "reconcile":
-        use_opus = len(parts) > 1 and "--opus" in parts[1]
-        plan_reconcile(use_opus=use_opus)
+        flags = parts[1] if len(parts) > 1 else ""
+        if "--opus" in flags:
+            plan_reconcile_direct()
+        else:
+            plan_reconcile(use_opus=False)
     elif subcmd == "split":
         plan_split()
     elif subcmd == "nuke":
@@ -2414,8 +2692,8 @@ def handle_plan_command(args_str, messages):
   /plan run q4        - Run with Q4 model explicitly
   /plan ab            - Save current run to git branch, reset for next model
   /plan compare       - Show side-by-side A/B model comparison
-  /plan reconcile     - Analyze all files for cross-module issues (Sonnet)
-  /plan reconcile --opus - Deep analysis with Opus (auto-escalates after 3 passes)
+  /plan reconcile     - Analyze all files for cross-module issues (Sonnet → Qwen fixes)
+  /plan reconcile --opus - Opus finds AND applies fixes directly (1-pass convergence)
   /plan hint <text>   - Give a fix suggestion for a failed task and retry
   /plan retry         - Reset failed task and retry from scratch
   /plan rollback      - Undo current task's file changes
@@ -3350,8 +3628,14 @@ def handle_command(user_input, messages):
         sonnet_input_cost = STATS["sonnet_input_tokens"] * CLAUDE_INPUT_COST_PER_M / 1_000_000
         sonnet_output_cost = STATS["sonnet_output_tokens"] * CLAUDE_OUTPUT_COST_PER_M / 1_000_000
         sonnet_spend = sonnet_input_cost + sonnet_output_cost
+        # Opus (actual spend) stats
+        opus_total = STATS["opus_input_tokens"] + STATS["opus_output_tokens"]
+        opus_input_cost = STATS["opus_input_tokens"] * OPUS_INPUT_COST_PER_M / 1_000_000
+        opus_output_cost = STATS["opus_output_tokens"] * OPUS_OUTPUT_COST_PER_M / 1_000_000
+        opus_spend = opus_input_cost + opus_output_cost
         # Net savings
-        net_saved = qwen_saved - sonnet_spend
+        total_spend = sonnet_spend + opus_spend
+        net_saved = qwen_saved - total_spend
         session_time = time.time() - STATS["start_time"] if STATS["start_time"] else 0
         print(f"""
   \033[1mQwen (local — free)\033[0m
@@ -3369,10 +3653,18 @@ def handle_command(user_input, messages):
   Requests:    {STATS['sonnet_requests']:>8}
   \033[33mSpent:       ${sonnet_spend:.3f}\033[0m
 
+  \033[1mOpus (Bedrock — actual cost)\033[0m
+  ─────────────────────────────────────
+  Tokens in:   {format_tokens(STATS['opus_input_tokens'], label=False):>8}   ${opus_input_cost:.3f}
+  Tokens out:  {format_tokens(STATS['opus_output_tokens'], label=False):>8}   ${opus_output_cost:.3f}
+  Total:       {format_tokens(opus_total, label=False):>8}
+  Requests:    {STATS['opus_requests']:>8}
+  \033[33mSpent:       ${opus_spend:.3f}\033[0m
+
   \033[1mSummary\033[0m
   ─────────────────────────────────────
   \033[32mSaved:       ${qwen_saved:.2f}\033[0m  (Qwen did this for free)
-  \033[33mSpent:       ${sonnet_spend:.3f}\033[0m  (Sonnet planning/reconcile)
+  \033[33mSpent:       ${total_spend:.3f}\033[0m  (Sonnet ${sonnet_spend:.3f} + Opus ${opus_spend:.3f})
   \033[1;32mNet saved:   ${net_saved:.2f}\033[0m
   Time:        {format_duration(session_time)}
   Model:       {MODEL}
